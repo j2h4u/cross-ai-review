@@ -44,10 +44,13 @@ Install as a Python CLI with your preferred isolated package tool:
 uv tool install .
 ```
 
-For development, run the repository launcher directly:
+This installs the `cross-ai` command into UV's executable directory (usually
+`~/.local/bin` on Linux; run `uv tool dir --bin` to see the exact location).
+
+For development, run the single source script directly:
 
 ```bash
-./cross-ai
+./cross_ai.py
 ```
 
 ## Usage

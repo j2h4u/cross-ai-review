@@ -13,7 +13,7 @@ from unittest import mock
 import cross_ai
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
-LAUNCHER = REPOSITORY_ROOT / "cross-ai"
+SCRIPT = REPOSITORY_ROOT / "cross_ai.py"
 
 
 def _write_fake_opencode(path: Path, *, hang: bool) -> None:
@@ -169,7 +169,7 @@ class CrossAiLifecycleTests(unittest.TestCase):
             env["OPENCODE_BIN"] = str(fake)
             result = subprocess.run(
                 [
-                    str(LAUNCHER),
+                    str(SCRIPT),
                     "--reviewer",
                     "deepseek-v4-pro",
                     "--no-shared-server",
@@ -223,7 +223,7 @@ class CrossAiLifecycleTests(unittest.TestCase):
             )
             process = subprocess.Popen(
                 [
-                    str(LAUNCHER),
+                    str(SCRIPT),
                     "--reviewer",
                     "deepseek-v4-pro",
                     "--no-shared-server",
