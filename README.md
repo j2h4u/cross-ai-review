@@ -5,13 +5,14 @@
 > Five copies of the same model receive nearly identical context, agree with
 > each other, and get presented as independent expert judgment.
 
-Cross-AI Review helps avoid that trap. It runs bounded planning and adversarial
-review across deliberately different AI command-line tools, then preserves one
-inspectable Markdown report per reviewer. Agreement is still evidence to
+Cross-AI Review helps avoid that trap. It runs adversarial review or fusion
+planning across deliberately different AI command-line tools, then preserves
+one inspectable Markdown report per reviewer. Agreement is still evidence to
 evaluate—not proof of an independent consensus.
 
 ## What it does
 
+- Supports two workflows: adversarial review and fusion planning.
 - Runs OpenCode, Claude Code, and Codex reviewers through explicit profiles.
 - Executes reviewers concurrently with per-model timeouts.
 - Keeps repository access read-only and blocks editing, builds, web access, and
@@ -51,13 +52,33 @@ For development, run the repository launcher directly:
 
 ## Usage
 
-Pass the exact workspace and one or more context files:
+Cross-AI has two modes:
+
+- **Review** (`--mode review`) asks each selected reviewer to challenge the
+  supplied context for correctness, design, security, operational risk, and
+  ship readiness.
+- **Fusion planning** (`--mode plan`) asks each selected reviewer for an
+  implementation-ready plan so their assumptions, sequencing, and tradeoffs can
+  be compared before implementation. Plans remain separate Markdown reports;
+  the command does not silently collapse them into manufactured consensus.
+
+Pass the exact workspace and one or more context files. Review is the default:
 
 ```bash
 cross-ai \
   --mode review \
   --repo-root /path/to/project \
   docs/plan.md
+```
+
+Run fusion planning against requirements or a design brief:
+
+```bash
+cross-ai \
+  --mode plan \
+  --repo-root /path/to/project \
+  --goal "Design the smallest safe implementation" \
+  docs/requirements.md
 ```
 
 The default profile runs the standard OpenCode reviewers. `--premium` runs the
