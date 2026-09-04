@@ -1,0 +1,7 @@
+#!/usr/bin/env python3
+"""Executable launcher for the canonical cross-ai implementation."""
+
+from cross_ai import main
+
+if __name__ == "__main__":
+    raise SystemExit(main())
