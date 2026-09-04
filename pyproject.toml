@@ -5,16 +5,18 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "cross-ai-review"
 version = "0.1.0"
-description = "Run bounded, parallel adversarial reviews with multiple AI CLIs."
+description = "Run bounded adversarial review and fusion planning across multiple AI CLIs."
 readme = "README.md"
 requires-python = ">=3.12"
 authors = [{ name = "j2h4u" }]
+keywords = ["ai", "code-review", "planning", "multi-agent", "cli"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Environment :: Console",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
 ]
 
 [project.scripts]
