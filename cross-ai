@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
-"""Executable launcher for the canonical cross-ai implementation."""
+"""Execute the canonical Cross-AI module next to this launcher."""
 
-from cross_ai import main
+import runpy
+from pathlib import Path
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    runpy.run_path(
+        str(Path(__file__).resolve().with_name("cross_ai.py")),
+        run_name="__main__",
+    )
