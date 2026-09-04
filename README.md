@@ -33,6 +33,20 @@ For development, run the repository launcher directly:
 ./cross-ai
 ```
 
+### Planned package distribution
+
+Cross-AI Review is planned to be published as a standalone package on PyPI so
+it can be installed on another machine by package name alone:
+
+```bash
+uv tool install cross-ai-review
+```
+
+Once published, `uv tool upgrade cross-ai-review` will update the isolated
+installation. PyPI publishing and the release workflow are not configured yet;
+the commands above describe the intended distribution model rather than the
+current installation path.
+
 ## Usage
 
 Pass the exact workspace and one or more context files:
@@ -63,15 +77,24 @@ Markdown reports remain in the output directory. As with any userspace cleanup,
 
 ## Development
 
-Run the focused lifecycle suite from the repository root:
+Install the locked development environment and run the focused lifecycle suite:
 
 ```bash
-python3 -m unittest discover -s tests -v
+uv sync
+just unit
 ```
+
+UV uses Python 3.14 for development, while the dependency-free CLI remains
+compatible with system Python 3.12 and newer.
 
 The suite covers the permission contract, temporary-directory limit and
 cleanup, successful report preservation, signal-driven process-group teardown,
 and partial shared-server startup.
+
+Run `just check` for formatting, lint, type, dead-code, lock, compile, and
+packaging checks. Run `just crap-check` for the per-function CRAP threshold of
+30, or `just verify` for the complete local quality contract. `just coverage`
+is a diagnostic report and does not enforce a standalone coverage target.
 
 This public repository currently has no open-source license. Public visibility
 does not grant permission to copy, modify, or redistribute the code.

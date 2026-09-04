@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import os
 import signal
 import stat
@@ -11,18 +12,20 @@ from unittest import mock
 
 import cross_ai
 
-
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 LAUNCHER = REPOSITORY_ROOT / "cross-ai"
 
 
 def _write_fake_opencode(path: Path, *, hang: bool) -> None:
     behavior = (
+        "runtime_pid = os.environ.get('CROSS_AI_TEST_RUNTIME_PID')\n"
+        "if runtime_pid:\n"
+        "    Path(runtime_pid).write_text(str(os.getpid()), encoding='utf-8')\n"
+        "child = subprocess.Popen(['sleep', '60'])\n"
+        "Path(os.environ['CROSS_AI_TEST_CHILD_PID']).write_text(str(child.pid), encoding='utf-8')\n"
         "marker = os.environ.get('CROSS_AI_TEST_MARKER')\n"
         "if marker:\n"
         "    Path(marker).write_text(os.environ['TMPDIR'], encoding='utf-8')\n"
-        "child = subprocess.Popen(['sleep', '60'])\n"
-        "Path(os.environ['CROSS_AI_TEST_CHILD_PID']).write_text(str(child.pid), encoding='utf-8')\n"
         "time.sleep(60)\n"
         if hang
         else ""
@@ -49,7 +52,68 @@ def _process_is_live(pid: int) -> bool:
     status_path = Path(f"/proc/{pid}/status")
     if not status_path.exists():
         return False
-    return "State:\tZ" not in status_path.read_text(encoding="utf-8")
+    with contextlib.suppress(FileNotFoundError):
+        return "State:\tZ" not in status_path.read_text(encoding="utf-8")
+    return False
+
+
+def _read_pid(path: Path) -> int | None:
+    try:
+        return int(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+def _process_cmdline(pid: int) -> bytes | None:
+    if not _process_is_live(pid):
+        return None
+    with contextlib.suppress(FileNotFoundError, OSError):
+        return Path(f"/proc/{pid}/cmdline").read_bytes()
+    return None
+
+
+def _fake_group_identity(fake: Path, runtime_pid: int, child_pid: int | None) -> bool:
+    runtime_cmdline = _process_cmdline(runtime_pid)
+    if runtime_cmdline is not None:
+        with contextlib.suppress(FileNotFoundError, OSError):
+            if os.getpgid(runtime_pid) == runtime_pid and str(fake).encode() in runtime_cmdline:
+                return True
+    if child_pid is None:
+        return False
+    child_cmdline = _process_cmdline(child_pid)
+    if child_cmdline is None:
+        return False
+    with contextlib.suppress(FileNotFoundError, OSError):
+        return os.getpgid(child_pid) == runtime_pid and b"sleep" in child_cmdline and b"60" in child_cmdline
+    return False
+
+
+def _terminate_fake_process_group(fake: Path, runtime_pid_path: Path, child_pid_path: Path) -> None:
+    runtime_pid = _read_pid(runtime_pid_path)
+    child_pid = _read_pid(child_pid_path)
+    if runtime_pid is None or runtime_pid <= 1 or not _fake_group_identity(fake, runtime_pid, child_pid):
+        return
+
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(runtime_pid, signal.SIGTERM)
+    deadline = time.monotonic() + 3
+    while (
+        _process_is_live(runtime_pid) or (child_pid is not None and _process_is_live(child_pid))
+    ) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    if _process_is_live(runtime_pid) or (child_pid is not None and _process_is_live(child_pid)):
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(runtime_pid, signal.SIGKILL)
+
+
+def _drain_subprocess(process: subprocess.Popen[str]) -> None:
+    if process.poll() is None:
+        process.kill()
+    try:
+        process.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.communicate(timeout=5)
 
 
 class CrossAiLifecycleTests(unittest.TestCase):
@@ -88,9 +152,7 @@ class CrossAiLifecycleTests(unittest.TestCase):
             self.assertEqual(env["BUN_TMPDIR"], str(path))
             (path / "oversized.so").write_bytes(b"xx")
             with self.assertRaises(cross_ai.TemporaryDirectoryLimitExceeded):
-                asyncio.run(
-                    cross_ai._monitor_temporary_directory(path, limit_bytes=1)
-                )
+                asyncio.run(cross_ai._monitor_temporary_directory(path, limit_bytes=1))
         finally:
             cross_ai._remove_temporary_directory(path)
         self.assertFalse(path.exists())
@@ -149,6 +211,7 @@ class CrossAiLifecycleTests(unittest.TestCase):
             context = root / "context.md"
             marker = root / "temp-path"
             child_pid_path = root / "child-pid"
+            runtime_pid_path = root / "runtime-pid"
             context.write_text("review me", encoding="utf-8")
             _write_fake_opencode(fake, hang=True)
             env = os.environ.copy()
@@ -156,6 +219,7 @@ class CrossAiLifecycleTests(unittest.TestCase):
                 OPENCODE_BIN=str(fake),
                 CROSS_AI_TEST_MARKER=str(marker),
                 CROSS_AI_TEST_CHILD_PID=str(child_pid_path),
+                CROSS_AI_TEST_RUNTIME_PID=str(runtime_pid_path),
             )
             process = subprocess.Popen(
                 [
@@ -176,10 +240,15 @@ class CrossAiLifecycleTests(unittest.TestCase):
             )
             try:
                 deadline = time.monotonic() + 10
-                while not marker.exists() and time.monotonic() < deadline:
+                while (
+                    not marker.exists() or not child_pid_path.exists() or not runtime_pid_path.exists()
+                ) and time.monotonic() < deadline:
                     time.sleep(0.05)
                 self.assertTrue(marker.exists(), "fake runtime did not start")
+                self.assertTrue(child_pid_path.exists(), "fake runtime child was not ready")
+                self.assertTrue(runtime_pid_path.exists(), "fake runtime PID was not ready")
                 child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+                runtime_pid = int(runtime_pid_path.read_text(encoding="utf-8"))
                 temporary_dir = Path(marker.read_text(encoding="utf-8"))
                 process.send_signal(signum)
                 _, stderr = process.communicate(timeout=15)
@@ -189,10 +258,10 @@ class CrossAiLifecycleTests(unittest.TestCase):
                 while _process_is_live(child_pid) and time.monotonic() < deadline:
                     time.sleep(0.05)
                 self.assertFalse(_process_is_live(child_pid))
+                self.assertFalse(_process_is_live(runtime_pid))
             finally:
-                if process.poll() is None:
-                    process.kill()
-                    process.wait(timeout=5)
+                _terminate_fake_process_group(fake, runtime_pid_path, child_pid_path)
+                _drain_subprocess(process)
         self.assertEqual(
             set(Path("/tmp").glob(f"cross-ai-{os.getuid()}-*")),
             before,
@@ -204,31 +273,35 @@ class CrossAiLifecycleTests(unittest.TestCase):
             fake = root / "opencode"
             marker = root / "temp-path"
             child_pid_path = root / "child-pid"
+            runtime_pid_path = root / "runtime-pid"
             temporary_dir = cross_ai._create_temporary_directory()
             _write_fake_opencode(fake, hang=True)
             environment = {
                 "CROSS_AI_TEST_MARKER": str(marker),
                 "CROSS_AI_TEST_CHILD_PID": str(child_pid_path),
+                "CROSS_AI_TEST_RUNTIME_PID": str(runtime_pid_path),
             }
             try:
-                with mock.patch.dict(os.environ, environment):
-                    with self.assertRaises(TimeoutError):
-                        asyncio.run(
-                            cross_ai._start_opencode_server(
-                                opencode_bin=str(fake),
-                                repo_root=root,
-                                output_dir=root,
-                                config_path=root / "config.json",
-                                temporary_dir=temporary_dir,
-                                timeout_seconds=1,
-                            )
+                with mock.patch.dict(os.environ, environment), self.assertRaises(TimeoutError):
+                    asyncio.run(
+                        cross_ai._start_opencode_server(
+                            opencode_bin=str(fake),
+                            repo_root=root,
+                            output_dir=root,
+                            config_path=root / "config.json",
+                            temporary_dir=temporary_dir,
+                            timeout_seconds=1,
                         )
+                    )
                 child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+                runtime_pid = int(runtime_pid_path.read_text(encoding="utf-8"))
                 deadline = time.monotonic() + 3
                 while _process_is_live(child_pid) and time.monotonic() < deadline:
                     time.sleep(0.05)
                 self.assertFalse(_process_is_live(child_pid))
+                self.assertFalse(_process_is_live(runtime_pid))
             finally:
+                _terminate_fake_process_group(fake, runtime_pid_path, child_pid_path)
                 cross_ai._remove_temporary_directory(temporary_dir)
 
 

@@ -22,3 +22,72 @@ cross-ai = "cross_ai:main"
 
 [tool.setuptools]
 py-modules = ["cross_ai"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["--strict-config", "--strict-markers", "-W", "error"]
+xfail_strict = true
+
+[tool.ruff]
+src = ["."]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+explicit-preview-rules = true
+select = [
+  "E4", "E7", "E9", "F", "I", "B", "BLE", "UP", "C4", "PIE", "RET",
+  "ISC", "RSE", "FLY", "FURB", "RUF", "PERF", "SIM", "PTH", "DTZ",
+  "PGH", "PLE", "LOG", "G", "N818", "ARG", "C90", "PLR09", "PLR17",
+  "PLR2004",
+]
+ignore = ["ISC001", "N818", "PLR0913", "SIM108"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["DTZ", "PERF401", "PLR2004"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.pyright]
+include = ["cross_ai.py", "scripts"]
+pythonVersion = "3.12"
+typeCheckingMode = "standard"
+reportAny = "none"
+reportExplicitAny = "error"
+reportUnknownVariableType = "none"
+reportUnknownArgumentType = "none"
+reportUnknownMemberType = "none"
+reportUnknownParameterType = "none"
+reportUnknownLambdaType = "none"
+reportMissingParameterType = "error"
+reportMissingTypeArgument = "none"
+reportUnannotatedClassAttribute = "none"
+reportUnusedCallResult = "none"
+reportImplicitStringConcatenation = "none"
+reportPrivateUsage = "none"
+
+[tool.vulture]
+paths = ["cross_ai.py", "scripts", "tests"]
+min_confidence = 80
+
+[tool.coverage.run]
+source = ["cross_ai"]
+branch = true
+sigterm = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+
+[dependency-groups]
+dev = [
+  "basedpyright>=1.39.10",
+  "pip-audit>=2.10.1",
+  "pytest>=9.1.1",
+  "pytest-cov>=7",
+  "pytest-crap>=0.3.0",
+  "radon>=6.0.1",
+  "ruff>=0.16.3",
+  "vulture>=2.16",
+]

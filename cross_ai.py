@@ -10,14 +10,14 @@ import http.client
 import json
 import os
 import re
-import signal
 import shlex
 import shutil
+import signal
 import socket
 import stat
 import sys
 import tempfile
-from collections.abc import Awaitable
+from collections.abc import Coroutine
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -119,9 +119,7 @@ class CodexSolReasoning(StrEnum):
     ULTRA = "ultra"
 
 
-type ModelReasoning = (
-    DeepSeekV4ProReasoning | Glm53Reasoning | ClaudeOpus5Reasoning | CodexSolReasoning
-)
+type ModelReasoning = DeepSeekV4ProReasoning | Glm53Reasoning | ClaudeOpus5Reasoning | CodexSolReasoning
 
 
 @dataclass(frozen=True)
@@ -134,8 +132,8 @@ class ReviewerSpec:
     enabled: bool = True
 
 
-REVIEWER_REGISTRY: dict[str, ReviewerSpec] = {
-    "deepseek-v4-pro": ReviewerSpec(
+REVIEWER_SPECS = (
+    ReviewerSpec(
         slug="deepseek-v4-pro",
         runtime="opencode",
         model="deepseek/deepseek-v4-pro",
@@ -143,7 +141,7 @@ REVIEWER_REGISTRY: dict[str, ReviewerSpec] = {
         timeout_seconds=900,
         enabled=True,
     ),
-    "glm-5-3": ReviewerSpec(
+    ReviewerSpec(
         slug="glm-5-3",
         runtime="opencode",
         model="zai-coding-plan/glm-5.3",
@@ -151,7 +149,7 @@ REVIEWER_REGISTRY: dict[str, ReviewerSpec] = {
         timeout_seconds=1800,
         enabled=True,
     ),
-    "claude-opus-5": ReviewerSpec(
+    ReviewerSpec(
         slug="claude-opus-5",
         runtime="claude",
         model="opus",
@@ -159,7 +157,7 @@ REVIEWER_REGISTRY: dict[str, ReviewerSpec] = {
         timeout_seconds=1200,
         enabled=True,
     ),
-    "codex-sol-xhigh": ReviewerSpec(
+    ReviewerSpec(
         slug="codex-sol-xhigh",
         runtime="codex",
         model="gpt-5.6-sol",
@@ -167,16 +165,12 @@ REVIEWER_REGISTRY: dict[str, ReviewerSpec] = {
         timeout_seconds=1800,
         enabled=False,
     ),
-}
+)
+REVIEWER_REGISTRY = {reviewer.slug: reviewer for reviewer in REVIEWER_SPECS}
 REVIEW_PROFILES: dict[str, tuple[str, ...]] = {
     "standard": ("deepseek-v4-pro", "glm-5-3"),
     "premium": ("claude-opus-5", "codex-sol-xhigh"),
-    "all": (
-        "deepseek-v4-pro",
-        "glm-5-3",
-        "claude-opus-5",
-        "codex-sol-xhigh",
-    ),
+    "all": tuple(REVIEWER_REGISTRY),
 }
 DEFAULT_PROFILE = "standard"
 
@@ -186,12 +180,10 @@ class ReviewResult:
     model: ReviewerSpec
     returncode: int
     output_path: Path
-    command: list[str]
     valid_output: bool
     elapsed_seconds: float
     validation_error: str | None = None
     permission_denials: tuple[PermissionDenial, ...] = ()
-    attempts: tuple[ReviewAttempt, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -205,7 +197,6 @@ class ReviewRequest:
     temporary_dir: Path
     timeout_seconds: int
     attach_url: str | None
-    agent: str | None
     min_output_chars: int
     require_review_markers: bool
 
@@ -354,45 +345,43 @@ def _opencode_permissions(repo_root: Path) -> dict[str, object]:
     }
 
 
-def _find_opencode() -> str:
-    explicit = os.environ.get("OPENCODE_BIN")
-    candidates = [
-        explicit,
-        shutil.which("opencode"),
-        str(Path.home() / ".opencode/bin/opencode"),
-    ]
+def _first_executable(*candidates: str | None) -> str | None:
     for candidate in candidates:
         if candidate and Path(candidate).is_file() and os.access(candidate, os.X_OK):
             return candidate
-    raise SystemExit(
-        "opencode binary not found. Set OPENCODE_BIN or install it at "
-        "~/.opencode/bin/opencode."
+    return None
+
+
+def _find_opencode() -> str:
+    candidate = _first_executable(
+        os.environ.get("OPENCODE_BIN"),
+        shutil.which("opencode"),
+        str(Path.home() / ".opencode/bin/opencode"),
     )
+    if candidate is not None:
+        return candidate
+    raise SystemExit("opencode binary not found. Set OPENCODE_BIN or install it at ~/.opencode/bin/opencode.")
 
 
 def _find_claude() -> str:
-    explicit = os.environ.get("CLAUDE_BIN")
-    candidates = [
-        explicit,
+    candidate = _first_executable(
+        os.environ.get("CLAUDE_BIN"),
         shutil.which("claude"),
         str(Path.home() / ".local/bin/claude"),
-    ]
-    for candidate in candidates:
-        if candidate and Path(candidate).is_file() and os.access(candidate, os.X_OK):
-            return candidate
+    )
+    if candidate is not None:
+        return candidate
     raise SystemExit("claude binary not found. Set CLAUDE_BIN or install Claude Code.")
 
 
 def _find_codex() -> str:
-    explicit = os.environ.get("CODEX_BIN")
-    candidates = [
-        explicit,
+    candidate = _first_executable(
+        os.environ.get("CODEX_BIN"),
         shutil.which("codex"),
         str(Path.home() / ".local/bin/codex"),
-    ]
-    for candidate in candidates:
-        if candidate and Path(candidate).is_file() and os.access(candidate, os.X_OK):
-            return candidate
+    )
+    if candidate is not None:
+        return candidate
     raise SystemExit("codex binary not found. Set CODEX_BIN or install Codex CLI.")
 
 
@@ -403,18 +392,11 @@ RUNTIME_FINDERS = {
 }
 
 
-def _timeout_seconds_for_model(review_model: ReviewerSpec) -> int:
-    return review_model.timeout_seconds
-
-
 def _reviewers_for_profile(profile: str) -> list[ReviewerSpec]:
     reviewer_names = REVIEW_PROFILES[profile]
     unknown = set(reviewer_names).difference(REVIEWER_REGISTRY)
     if unknown:
-        raise SystemExit(
-            f"review profile {profile!r} references unknown reviewer(s): "
-            f"{', '.join(sorted(unknown))}"
-        )
+        raise SystemExit(f"review profile {profile!r} references unknown reviewer(s): {', '.join(sorted(unknown))}")
     return [REVIEWER_REGISTRY[name] for name in reviewer_names]
 
 
@@ -429,19 +411,9 @@ def _selected_reviewers(args: argparse.Namespace) -> tuple[ReviewerSpec, ...]:
         else:
             profile = DEFAULT_PROFILE
         reviewers = _reviewers_for_profile(profile)
-    disabled_slugs = {
-        reviewer.slug for reviewer in REVIEWER_REGISTRY.values() if not reviewer.enabled
-    }
-    selected = tuple(
-        reviewer
-        for reviewer in reviewers
-        if reviewer.enabled and reviewer.slug not in disabled_slugs
-    )
+    selected = tuple(reviewer for reviewer in reviewers if reviewer.enabled)
     if not selected:
-        raise SystemExit(
-            "no reviewers are enabled; set enabled=True for at least one "
-            "REVIEWER_REGISTRY profile"
-        )
+        raise SystemExit("no reviewers are enabled; set enabled=True for at least one REVIEWER_REGISTRY profile")
     return selected
 
 
@@ -449,9 +421,7 @@ def _runtime_bins(reviewers: tuple[ReviewerSpec, ...]) -> dict[str, str]:
     runtimes = {reviewer.runtime for reviewer in reviewers}
     unknown = runtimes.difference(RUNTIME_FINDERS)
     if unknown:
-        raise SystemExit(
-            f"unsupported reviewer runtime(s): {', '.join(sorted(unknown))}"
-        )
+        raise SystemExit(f"unsupported reviewer runtime(s): {', '.join(sorted(unknown))}")
     return {runtime: RUNTIME_FINDERS[runtime]() for runtime in runtimes}
 
 
@@ -516,8 +486,7 @@ async def _monitor_temporary_directory(path: Path, *, limit_bytes: int) -> None:
         size_bytes = _temporary_directory_size(path)
         if size_bytes > limit_bytes:
             raise TemporaryDirectoryLimitExceeded(
-                f"temporary directory exceeded {limit_bytes} bytes: "
-                f"{size_bytes} bytes in {path}"
+                f"temporary directory exceeded {limit_bytes} bytes: {size_bytes} bytes in {path}"
             )
         await asyncio.sleep(OPENCODE_TEMP_POLL_SECONDS)
 
@@ -598,9 +567,7 @@ def _decode_review_output(stdout: bytes) -> list[dict[str, object]]:
         try:
             event = json.loads(line)
         except json.JSONDecodeError as exc:
-            raise ValueError(
-                f"review output line {line_number} is not valid JSON: {exc.msg}"
-            ) from exc
+            raise ValueError(f"review output line {line_number} is not valid JSON: {exc.msg}") from exc
         if not isinstance(event, dict):
             raise ValueError(f"review output line {line_number} is not a JSON object")
         events.append(event)
@@ -643,9 +610,7 @@ def _permission_denial(event: dict[str, object]) -> PermissionDenial | None:
 def _permission_denials(
     events: list[dict[str, object]],
 ) -> tuple[PermissionDenial, ...]:
-    return tuple(
-        denial for event in events if (denial := _permission_denial(event)) is not None
-    )
+    return tuple(denial for event in events if (denial := _permission_denial(event)) is not None)
 
 
 def _collect_review_parts(
@@ -672,10 +637,7 @@ def _extract_final_review_text(stdout: bytes) -> str:
         raise ValueError("review output has no completed assistant step")
     final_part = finish_parts[-1]
     if final_part.get("reason") != "stop":
-        raise ValueError(
-            "review output has no final assistant response: "
-            f"reason={final_part.get('reason')!r}"
-        )
+        raise ValueError(f"review output has no final assistant response: reason={final_part.get('reason')!r}")
     message_id = final_part.get("messageID")
     if not isinstance(message_id, str):
         raise ValueError("final review step has no valid messageID")
@@ -689,19 +651,24 @@ def _validate_review_output(
     stdout: bytes, *, min_output_chars: int, require_review_markers: bool
 ) -> tuple[str | None, str | None]:
     try:
-        final_text = _extract_final_review_text(stdout)
-        if len(final_text) < min_output_chars:
-            raise ValueError(
-                f"final assistant response too short: {len(final_text)} chars, "
-                f"expected at least {min_output_chars}"
-            )
-        if require_review_markers and not REVIEW_MARKER_PATTERN.search(final_text):
-            raise ValueError(
-                "final assistant response did not contain expected review markers"
-            )
+        final_text = _validate_final_review_text(
+            _extract_final_review_text(stdout),
+            min_output_chars=min_output_chars,
+            require_review_markers=require_review_markers,
+        )
     except ValueError as exc:
         return None, str(exc)
     return final_text, None
+
+
+def _validate_final_review_text(final_text: str, *, min_output_chars: int, require_review_markers: bool) -> str:
+    if len(final_text) < min_output_chars:
+        raise ValueError(
+            f"final assistant response too short: {len(final_text)} chars, expected at least {min_output_chars}"
+        )
+    if require_review_markers and not REVIEW_MARKER_PATTERN.search(final_text):
+        raise ValueError("final assistant response did not contain expected review markers")
+    return final_text
 
 
 def _find_free_port() -> int:
@@ -749,9 +716,7 @@ async def _start_opencode_server(
     with log_path.open("wb") as log_handle:
         log_handle.write(
             (
-                "# OpenCode shared server\n\n"
-                f"Command:\n\n```bash\n{_render_command(command)}\n```\n\n"
-                "Output:\n\n"
+                f"# OpenCode shared server\n\nCommand:\n\n```bash\n{_render_command(command)}\n```\n\nOutput:\n\n"
             ).encode()
         )
         log_handle.flush()
@@ -768,9 +733,7 @@ async def _start_opencode_server(
         deadline = asyncio.get_running_loop().time() + timeout_seconds
         while asyncio.get_running_loop().time() < deadline:
             if process.returncode is not None:
-                raise RuntimeError(
-                    f"opencode serve exited before becoming healthy; see {log_path}"
-                )
+                raise RuntimeError(f"opencode serve exited before becoming healthy; see {log_path}")
             if await asyncio.to_thread(_server_healthcheck, port):
                 return OpenCodeServer(process=process, url=url, log_path=log_path)
             await asyncio.sleep(0.25)
@@ -804,13 +767,8 @@ def _signal_process_group(process_group: int, signum: int) -> None:
 async def _terminate_process(process: asyncio.subprocess.Process) -> None:
     process_group = process.pid
     _signal_process_group(process_group, signal.SIGTERM)
-    deadline = (
-        asyncio.get_running_loop().time() + PROCESS_TERMINATION_GRACE_SECONDS
-    )
-    while (
-        _process_group_exists(process_group)
-        and asyncio.get_running_loop().time() < deadline
-    ):
+    deadline = asyncio.get_running_loop().time() + PROCESS_TERMINATION_GRACE_SECONDS
+    while _process_group_exists(process_group) and asyncio.get_running_loop().time() < deadline:
         await asyncio.sleep(0.05)
     if _process_group_exists(process_group):
         _signal_process_group(process_group, signal.SIGKILL)
@@ -818,9 +776,7 @@ async def _terminate_process(process: asyncio.subprocess.Process) -> None:
         await process.wait()
 
 
-def _opencode_review_command(
-    request: ReviewRequest, *, attach_url: str | None
-) -> list[str]:
+def _opencode_review_command(request: ReviewRequest, *, attach_url: str | None) -> list[str]:
     review_model = request.review_model
     command = [
         request.runtime_bin,
@@ -828,8 +784,7 @@ def _opencode_review_command(
         "--model",
         review_model.model,
     ]
-    if request.agent:
-        command.extend(["--agent", request.agent])
+    command.extend(["--agent", "plan"])
     command.extend(["--format", "json"])
     if review_model.reasoning:
         command.extend(["--variant", review_model.reasoning.value])
@@ -843,13 +798,15 @@ def _opencode_review_command(
     return command
 
 
-def _claude_review_command(request: ReviewRequest) -> list[str]:
+def _copied_context_prompt(request: ReviewRequest) -> str:
     context = "\n".join(f"- {path}" for path in request.context_files)
-    prompt = (
-        f"{request.prompt}\n\n"
-        "Review the following copied context files in addition to repository evidence:\n"
-        f"{context}"
+    return (
+        f"{request.prompt}\n\nReview the following copied context files in addition to repository evidence:\n{context}"
     )
+
+
+def _claude_review_command(request: ReviewRequest) -> list[str]:
+    prompt = _copied_context_prompt(request)
     command = [
         request.runtime_bin,
         "-p",
@@ -867,12 +824,7 @@ def _claude_review_command(request: ReviewRequest) -> list[str]:
 
 
 def _codex_review_command(request: ReviewRequest) -> list[str]:
-    context = "\n".join(f"- {path}" for path in request.context_files)
-    prompt = (
-        f"{request.prompt}\n\n"
-        "Review the following copied context files in addition to repository evidence:\n"
-        f"{context}"
-    )
+    prompt = _copied_context_prompt(request)
     command = [
         request.runtime_bin,
         "exec",
@@ -943,42 +895,26 @@ def _extract_codex_review_text(stdout: bytes) -> str:
     return messages[-1]
 
 
-def _validate_runtime_output(
-    request: ReviewRequest, stdout: bytes
-) -> tuple[str | None, str | None]:
-    if request.review_model.runtime == "opencode":
-        return _validate_review_output(
-            stdout,
-            min_output_chars=request.min_output_chars,
-            require_review_markers=request.require_review_markers,
-        )
+def _validate_runtime_output(request: ReviewRequest, stdout: bytes) -> tuple[str | None, str | None]:
     extractors = {
+        "opencode": _extract_final_review_text,
         "claude": _extract_claude_review_text,
         "codex": _extract_codex_review_text,
     }
     if request.review_model.runtime not in extractors:
         return None, f"unsupported output runtime: {request.review_model.runtime}"
     try:
-        final_text = extractors[request.review_model.runtime](stdout)
-        if len(final_text) < request.min_output_chars:
-            raise ValueError(
-                f"final assistant response too short: {len(final_text)} chars, "
-                f"expected at least {request.min_output_chars}"
-            )
-        if request.require_review_markers and not REVIEW_MARKER_PATTERN.search(
-            final_text
-        ):
-            raise ValueError(
-                "final assistant response did not contain expected review markers"
-            )
+        final_text = _validate_final_review_text(
+            extractors[request.review_model.runtime](stdout),
+            min_output_chars=request.min_output_chars,
+            require_review_markers=request.require_review_markers,
+        )
     except ValueError as exc:
         return None, str(exc)
     return final_text, None
 
 
-async def _review_attempt(
-    request: ReviewRequest, *, attach_url: str | None, config_path: Path
-) -> ReviewAttempt:
+async def _review_attempt(request: ReviewRequest, *, attach_url: str | None, config_path: Path) -> ReviewAttempt:
     command = _review_command(request, attach_url=attach_url)
 
     env = (
@@ -997,9 +933,7 @@ async def _review_attempt(
     )
     timed_out = False
     try:
-        stdout, _ = await asyncio.wait_for(
-            process.communicate(), timeout=request.timeout_seconds
-        )
+        stdout, _ = await asyncio.wait_for(process.communicate(), timeout=request.timeout_seconds)
     except TimeoutError:
         timed_out = True
         await _terminate_process(process)
@@ -1028,9 +962,7 @@ async def _review_attempt(
     )
 
 
-async def _collect_review_attempts(
-    request: ReviewRequest, *, config_path: Path
-) -> list[ReviewAttempt]:
+async def _collect_review_attempts(request: ReviewRequest, *, config_path: Path) -> list[ReviewAttempt]:
     attempts = [
         await _review_attempt(
             request,
@@ -1044,9 +976,7 @@ async def _collect_review_attempts(
         and attempts[0].returncode == 0
         and attempts[0].validation_error is not None
     ):
-        attempts.append(
-            await _review_attempt(request, attach_url=None, config_path=config_path)
-        )
+        attempts.append(await _review_attempt(request, attach_url=None, config_path=config_path))
     return attempts
 
 
@@ -1067,9 +997,7 @@ def _review_result_header(
             "A direct retry was performed because the attached shared-server "
             f"output failed validation: {attempts[0].validation_error}\n\n"
         )
-    commands = "\n".join(
-        f"- {item.mode}: {_render_command(item.command)}" for item in attempts
-    )
+    commands = "\n".join(f"- {item.mode}: {_render_command(item.command)}" for item in attempts)
     return (
         f"# Cross-AI Result: {review_model.slug}\n\n"
         f"Execution attempts:\n\n{commands}\n\n"
@@ -1087,16 +1015,9 @@ def _review_result_body(
 ) -> bytes:
     sections: list[bytes] = []
     if attempt.timed_out:
-        sections.append(
-            f"ERROR: review timed out after {request.timeout_seconds} seconds.\n\n".encode()
-        )
+        sections.append(f"ERROR: review timed out after {request.timeout_seconds} seconds.\n\n".encode())
     if attempt.validation_error is not None:
-        sections.append(
-            (
-                "ERROR: review output failed validation: "
-                f"{attempt.validation_error}\n\n"
-            ).encode()
-        )
+        sections.append((f"ERROR: review output failed validation: {attempt.validation_error}\n\n").encode())
     if valid_output and attempt.final_text is not None:
         sections.append(f"{attempt.final_text}\n".encode())
     else:
@@ -1130,14 +1051,10 @@ async def _run_review(request: ReviewRequest, *, config_path: Path) -> ReviewRes
         model=request.review_model,
         returncode=returncode,
         output_path=output_path,
-        command=attempt.command,
         valid_output=valid_output,
         elapsed_seconds=monotonic() - started_at,
         validation_error=attempt.validation_error,
-        permission_denials=tuple(
-            denial for item in attempts for denial in item.permission_denials
-        ),
-        attempts=tuple(attempts),
+        permission_denials=tuple(denial for item in attempts for denial in item.permission_denials),
     )
 
 
@@ -1148,9 +1065,7 @@ def _resolve_output_root(repo_root: Path, output_dir: str) -> Path:
     else:
         output_root = output_root.resolve()
     if not output_root.is_relative_to(repo_root):
-        raise SystemExit(
-            f"output directory must be inside repository root: {output_root}"
-        )
+        raise SystemExit(f"output directory must be inside repository root: {output_root}")
     return output_root
 
 
@@ -1178,15 +1093,9 @@ def _write_run_summary(
         handle.write(f"- repo root: `{summary.repo_root}`\n")
         handle.write(f"- mode: `{summary.mode}`\n")
         handle.write(f"- output directory: `{summary.output_dir}`\n")
-        handle.write(
-            f"- total wall time: `{_format_duration(summary.elapsed_seconds)}`\n"
-        )
-        server_log = (
-            summary.server.log_path if summary.server else "not started (direct mode)"
-        )
-        handle.write(
-            f"- execution mode: `{'shared' if summary.server else 'direct'}`\n"
-        )
+        handle.write(f"- total wall time: `{_format_duration(summary.elapsed_seconds)}`\n")
+        server_log = summary.server.log_path if summary.server else "not started (direct mode)"
+        handle.write(f"- execution mode: `{'shared' if summary.server else 'direct'}`\n")
         handle.write(f"- shared opencode server: `{server_log}`\n")
         handle.write(f"- OpenCode permission config: `{summary.config_path}`\n")
         handle.write("- context files:\n")
@@ -1233,18 +1142,17 @@ def _print_run_summary(
 
 def _prepare_run(args: argparse.Namespace, *, temporary_dir: Path) -> PreparedRun:
     repo_root = _existing_directory(args.repo_root, label="repository root")
-    raw_files = [
-        _existing_file(path, label="context file") for path in args.context_file
-    ]
-
+    raw_files = [_existing_file(path, label="context file") for path in args.context_file]
     output_root = _resolve_output_root(repo_root, args.output_dir)
+    models = _selected_reviewers(args)
+    runtime_bins = _runtime_bins(models)
+    prompt = _build_prompt(args.mode, args.goal, repo_root)
+
     output_dir = _create_run_directory(output_root)
     config_path = _write_opencode_config(output_dir, repo_root)
     context_files = _copy_context_files(raw_files, output_dir)
-    prompt = _build_prompt(args.mode, args.goal, repo_root)
-    models = _selected_reviewers(args)
     return PreparedRun(
-        runtime_bins=_runtime_bins(models),
+        runtime_bins=runtime_bins,
         repo_root=repo_root,
         mode=args.mode,
         output_dir=output_dir,
@@ -1260,30 +1168,21 @@ def _prepare_run(args: argparse.Namespace, *, temporary_dir: Path) -> PreparedRu
 def _print_startup(run: PreparedRun) -> None:
     sys.stdout.write("Cross-AI startup\n")
     sys.stdout.write(f"- repo root: {run.repo_root}\n")
-    sys.stdout.write(
-        f"- mode: {run.mode}; execution: {'shared' if run.shared_mode else 'direct'}\n"
-    )
+    sys.stdout.write(f"- mode: {run.mode}; execution: {'shared' if run.shared_mode else 'direct'}\n")
     sys.stdout.write(f"- output directory: {run.output_dir}\n")
-    sys.stdout.write(
-        f"- temporary directory: {run.temporary_dir}; "
-        f"limit={OPENCODE_TEMP_LIMIT_BYTES} bytes\n"
-    )
+    sys.stdout.write(f"- temporary directory: {run.temporary_dir}; limit={OPENCODE_TEMP_LIMIT_BYTES} bytes\n")
     for model in run.models:
         sys.stdout.write(
             f"- reviewer: {model.slug}; runtime={model.runtime}; "
             f"model={model.model}:"
             f"{model.reasoning.value if model.reasoning else 'default'}; "
-            f"timeout={_timeout_seconds_for_model(model)}s\n"
+            f"timeout={model.timeout_seconds}s\n"
         )
     sys.stdout.flush()
 
 
 def _reviewer_profile_names(reviewer_slug: str) -> str:
-    profiles = [
-        profile
-        for profile, reviewer_slugs in REVIEW_PROFILES.items()
-        if reviewer_slug in reviewer_slugs
-    ]
+    profiles = [profile for profile, reviewer_slugs in REVIEW_PROFILES.items() if reviewer_slug in reviewer_slugs]
     return ",".join(profiles) or "-"
 
 
@@ -1315,25 +1214,17 @@ def _reviewer_registry_table() -> str:
         )
         for reviewer in REVIEWER_REGISTRY.values()
     ]
-    widths = [
-        max(len(header), *(len(row[index]) for row in rows))
-        for index, header in enumerate(headers)
-    ]
+    widths = [max(len(header), *(len(row[index]) for row in rows)) for index, header in enumerate(headers)]
     lines = [
         "  ".join(header.ljust(widths[index]) for index, header in enumerate(headers)),
         "  ".join("-" * width for width in widths),
     ]
-    lines.extend(
-        "  ".join(value.ljust(widths[index]) for index, value in enumerate(row))
-        for row in rows
-    )
+    lines.extend("  ".join(value.ljust(widths[index]) for index, value in enumerate(row)) for row in rows)
     return "\n".join(lines)
 
 
 async def _start_run_server(run: PreparedRun) -> OpenCodeServer | None:
-    if not run.shared_mode or not any(
-        reviewer.runtime == "opencode" for reviewer in run.models
-    ):
+    if not run.shared_mode or not any(reviewer.runtime == "opencode" for reviewer in run.models):
         return None
     return await _start_opencode_server(
         opencode_bin=run.runtime_bins["opencode"],
@@ -1344,9 +1235,7 @@ async def _start_run_server(run: PreparedRun) -> OpenCodeServer | None:
     )
 
 
-def _review_tasks(
-    run: PreparedRun, server: OpenCodeServer | None
-) -> list[Awaitable[ReviewResult]]:
+def _review_tasks(run: PreparedRun, server: OpenCodeServer | None) -> list[Coroutine[object, object, ReviewResult]]:
     return [
         _run_review(
             ReviewRequest(
@@ -1357,13 +1246,8 @@ def _review_tasks(
                 prompt=run.prompt,
                 output_dir=run.output_dir,
                 temporary_dir=run.temporary_dir,
-                timeout_seconds=_timeout_seconds_for_model(review_model),
-                attach_url=(
-                    server.url
-                    if server and review_model.runtime == "opencode"
-                    else None
-                ),
-                agent="plan" if review_model.runtime == "opencode" else None,
+                timeout_seconds=review_model.timeout_seconds,
+                attach_url=(server.url if server and review_model.runtime == "opencode" else None),
                 min_output_chars=DEFAULT_MIN_OUTPUT_CHARS,
                 require_review_markers=run.mode == "review",
             ),
@@ -1373,9 +1257,7 @@ def _review_tasks(
     ]
 
 
-async def _execute_reviews(
-    run: PreparedRun, server: OpenCodeServer | None
-) -> list[ReviewResult]:
+async def _execute_reviews(run: PreparedRun, server: OpenCodeServer | None) -> list[ReviewResult]:
     results: list[ReviewResult] = []
     tasks = [asyncio.create_task(task) for task in _review_tasks(run, server)]
     try:
@@ -1551,10 +1433,7 @@ def _build_parser() -> argparse.ArgumentParser:
     reviewer_selection.add_argument(
         "--premium",
         action="store_true",
-        help=(
-            "Run the globally enabled premium final-gate reviewers. "
-            "Use after the default cheap reviewers say GO."
-        ),
+        help=("Run the globally enabled premium final-gate reviewers. Use after the default cheap reviewers say GO."),
     )
     reviewer_selection.add_argument(
         "--all",
@@ -1582,10 +1461,7 @@ def main() -> int:
         sys.stdout.write(parser.format_help())
         return 0
     args = _parse_args(parser)
-    sys.stdout.write(
-        f"Starting cross-ai in {args.mode} mode. "
-        "Run cross-ai without arguments for usage guidance.\n"
-    )
+    sys.stdout.write(f"Starting cross-ai in {args.mode} mode. Run cross-ai without arguments for usage guidance.\n")
     sys.stdout.flush()
     try:
         return asyncio.run(_main_async(args))
@@ -1594,17 +1470,11 @@ def main() -> int:
         sys.stderr.flush()
         return 75
     except TerminationSignalReceived as exc:
-        sys.stderr.write(
-            "Cross-AI terminated; reviewer processes and temporary files "
-            "were cleaned up.\n"
-        )
+        sys.stderr.write("Cross-AI terminated; reviewer processes and temporary files were cleaned up.\n")
         sys.stderr.flush()
         return 128 + exc.signum
     except KeyboardInterrupt:
-        sys.stderr.write(
-            "Cross-AI interrupted; reviewer processes and temporary files "
-            "were cleaned up.\n"
-        )
+        sys.stderr.write("Cross-AI interrupted; reviewer processes and temporary files were cleaned up.\n")
         sys.stderr.flush()
         return 130
 

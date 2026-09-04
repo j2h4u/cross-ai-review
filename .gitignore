@@ -1,8 +1,15 @@
+# Python and QA caches
 __pycache__/
 *.py[cod]
-*.egg-info/
-.adversarial-reviews/
 .pytest_cache/
+.ruff_cache/
+.pyright/
+.basedpyright/
+.coverage
+coverage.json
+htmlcov/
 .venv/
 build/
 dist/
+*.egg-info/
+.adversarial-reviews/
