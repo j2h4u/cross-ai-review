@@ -1,8 +1,24 @@
 # Cross-AI Review
 
-Cross-AI Review runs bounded planning and adversarial-review passes through a
-configured panel of AI command-line tools. It keeps the reviewers focused on
-repository evidence while preserving one Markdown report per model.
+> ### Consensus Cosplay
+>
+> Five copies of the same model receive nearly identical context, agree with
+> each other, and get presented as independent expert judgment.
+
+Cross-AI Review helps avoid that trap. It runs bounded planning and adversarial
+review across deliberately different AI command-line tools, then preserves one
+inspectable Markdown report per reviewer. Agreement is still evidence to
+evaluate—not proof of an independent consensus.
+
+## What it does
+
+- Runs OpenCode, Claude Code, and Codex reviewers through explicit profiles.
+- Executes reviewers concurrently with per-model timeouts.
+- Keeps repository access read-only and blocks editing, builds, web access, and
+  nested delegation.
+- Validates runtime-specific output and records failed or denied attempts.
+- Cleans up process groups and bounded per-run temporary storage while keeping
+  the review reports.
 
 The permission model assumes a trusted operator, workspace, repository, and
 reviewer. It is a behavioral and resource boundary, not a hostile-code security
@@ -32,20 +48,6 @@ For development, run the repository launcher directly:
 ```bash
 ./cross-ai
 ```
-
-### Planned package distribution
-
-Cross-AI Review is planned to be published as a standalone package on PyPI so
-it can be installed on another machine by package name alone:
-
-```bash
-uv tool install cross-ai-review
-```
-
-Once published, `uv tool upgrade cross-ai-review` will update the isolated
-installation. PyPI publishing and the release workflow are not configured yet;
-the commands above describe the intended distribution model rather than the
-current installation path.
 
 ## Usage
 
