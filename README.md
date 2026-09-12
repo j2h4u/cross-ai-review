@@ -31,10 +31,57 @@ builds, general shell commands, web access, and nested delegation are disabled.
 
 - Python 3.12 or newer
 - [OpenCode](https://opencode.ai/) for the standard reviewers
-- Claude Code and Codex only when their optional reviewer profiles are enabled
+- Claude Code and Codex only when selected reviewers use those runtimes
 
 Provider authentication and model access are managed by the corresponding AI
 CLI. No credentials are stored in this repository.
+
+## Configuration
+
+Cross-AI has one active TOML file: `$XDG_CONFIG_HOME/cross-ai/config.toml`, or
+`~/.config/cross-ai/config.toml` when `XDG_CONFIG_HOME` is unset. It never
+searches the current directory or other fallback locations. Create it from the
+shipped template with:
+
+```bash
+cross-ai --init-config
+```
+
+The command refuses to overwrite an existing file. The complete schema is:
+
+```toml
+default_profile = "standard"
+default_timeout_seconds = 900
+
+[runtimes.opencode]
+binary = "/absolute/path/to/opencode" # optional
+
+[profiles.standard]
+reviewers = ["reviewer-slug"]
+
+[reviewers.reviewer-slug]
+runtime = "opencode"
+model = "provider/model"
+reasoning = "max"       # optional
+timeout_seconds = 1200   # optional; inherits the top-level default
+```
+
+The top-level tables are exactly `runtimes`, `profiles`, and `reviewers`;
+unknown keys, missing keys, invalid names, types, and references are errors.
+There is no schema `version` and no reviewer `enabled` flag. Reviewer names use
+lowercase letters, digits, and hyphens. Runtime names are `opencode`, `claude`,
+and `codex`; profiles contain one or more reviewer slugs. The default profile
+must name a configured profile other than the reserved `all` name.
+
+Use `cross-ai doctor` to validate the configuration and inspect every runtime
+in the configured catalog. Missing binaries are reported as unavailable and do
+not prevent the orphan-reviewer warning. A reviewer not listed in any profile
+is an orphan: it remains selectable explicitly or through `--all`.
+
+Runtime binaries resolve in this order: an explicitly configured absolute,
+executable `binary`; the runtime's standard installation path; then its name
+on `PATH`. Environment variables such as `OPENCODE_BIN`, `CLAUDE_BIN`, and
+`CODEX_BIN` are not consulted.
 
 ## Installation
 
@@ -84,13 +131,29 @@ cross-ai \
   docs/requirements.md
 ```
 
-The default profile runs the standard OpenCode reviewers. `--premium` runs the
-configured premium gate, `--all` runs every enabled reviewer, and repeated
+The default profile runs `default_profile`. `--profile NAME` selects another
+configured profile, `--premium` selects the profile named `premium`, `--all`
+runs every configured reviewer (including orphans), and repeated
 `--reviewer SLUG` options select specific reviewers. Run `cross-ai` without
-arguments for the full operational workflow and current registry.
+arguments for the concise usage protocol and CLI help. No-args help does not
+load the active configuration or display its reviewer catalog.
 
 Reports are written under `.adversarial-reviews/` inside the selected workspace
 unless `--output-dir` specifies another directory within that workspace.
+
+## Agent usage protocol
+
+The agent-owned review loop is deliberately explicit: run the cheap/default
+profile, fix findings, and repeat until the cheap reviewers converge; run the
+explicit premium profile; if premium finds blockers, return to the cheap loop
+until it converges again, then run premium once more. Use a named profile when
+the task needs a different team, `--reviewer` for diagnosis or a retry, and
+`--all` only when the full configured catalog is wanted.
+
+Cross-AI itself is one pass with no persisted state: it never iterates, tracks
+convergence, or runs premium automatically. Its exit status is technical only
+(successful process/output validation), not a semantic GO decision; the agent
+must inspect the Markdown reports and decide what to do next.
 
 ## Temporary-file containment
 

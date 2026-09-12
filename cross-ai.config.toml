@@ -1,0 +1,37 @@
+default_profile = "standard"
+default_timeout_seconds = 900
+
+[runtimes.opencode]
+
+[runtimes.claude]
+
+[runtimes.codex]
+
+[profiles.standard]
+reviewers = ["deepseek-v4-pro", "glm-5-3"]
+
+[profiles.premium]
+reviewers = ["claude-opus-5"]
+
+[reviewers.deepseek-v4-pro]
+runtime = "opencode"
+model = "deepseek/deepseek-v4-pro"
+reasoning = "max"
+
+[reviewers.glm-5-3]
+runtime = "opencode"
+model = "zai-coding-plan/glm-5.3"
+reasoning = "max"
+timeout_seconds = 1800
+
+[reviewers.claude-opus-5]
+runtime = "claude"
+model = "opus"
+reasoning = "low"
+timeout_seconds = 1200
+
+[reviewers.codex-sol-xhigh]
+runtime = "codex"
+model = "gpt-5.6-sol"
+reasoning = "xhigh"
+timeout_seconds = 1800

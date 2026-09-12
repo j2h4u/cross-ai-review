@@ -25,6 +25,9 @@ cross-ai = "cross_ai:main"
 [tool.setuptools]
 py-modules = ["cross_ai"]
 
+[tool.setuptools.data-files]
+"share/cross-ai-review" = ["cross-ai.config.toml"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = ["--strict-config", "--strict-markers", "-W", "error"]

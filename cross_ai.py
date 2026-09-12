@@ -16,11 +16,12 @@ import signal
 import socket
 import stat
 import sys
+import sysconfig
 import tempfile
+import tomllib
 from collections.abc import Coroutine
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from enum import StrEnum
 from http import HTTPStatus
 from pathlib import Path
 from time import monotonic
@@ -29,7 +30,8 @@ DEFAULT_REVIEW_PROMPT = (
     "Adversarially review the attached context. Focus on correctness, design fit, "
     "security/privacy, operational risk, and whether this is ready to ship. "
     "Return Critical/High/Medium/Low findings first, ordered by severity, with "
-    "file/line references where possible. Avoid nitpicks. Do not edit files."
+    "file/line references where possible. End explicitly with GO or NO-GO, a brief "
+    "rationale, and any remaining actionable blockers. Avoid nitpicks. Do not edit files."
 )
 DEFAULT_PLAN_PROMPT = (
     "Create an implementation-ready plan for the stated goal and attached context. "
@@ -37,7 +39,6 @@ DEFAULT_PLAN_PROMPT = (
     "verification. Do not edit files."
 )
 
-DEFAULT_TIMEOUT_SECONDS = 900
 DEFAULT_MIN_OUTPUT_CHARS = 200
 OUTPUT_INVALID_RETURNCODE = 86
 DEFAULT_OUTPUT_DIR = ".adversarial-reviews"
@@ -47,79 +48,40 @@ OPENCODE_TEMP_POLL_SECONDS = 1.0
 PROCESS_TERMINATION_GRACE_SECONDS = 3.0
 TERMINATION_SIGNALS = (signal.SIGHUP, signal.SIGTERM, signal.SIGQUIT)
 REVIEW_MARKER_PATTERN = re.compile(
-    r"\b(Critical|High|Medium|Low|Finding|Findings|Verdict|SHIP|NO-SHIP|"
+    r"\b(Critical|High|Medium|Low|Finding|Findings|Verdict|GO|NO-GO|SHIP|NO-SHIP|"
     r"No ship|ship blocker|blocker|issue|issues)\b",
     re.IGNORECASE,
 )
-MENTAL_MODEL = """Run bounded AI reviewers in parallel for planning or review.
+MENTAL_MODEL = """Run bounded AI reviewers in one planning or review pass.
 
-You must name the exact project directory with --repo-root. OpenCode runs with
-that directory as both its process cwd and --dir, while the prompt independently
-forbids looking elsewhere. REVIEWER_REGISTRY describes each runtime, model,
-reasoning level, and timeout; REVIEW_PROFILES defines the complete reviewer team
-for each run. Set a reviewer's enabled field to False to disable it globally for
-standard, premium, all, and explicit reviewer selection.
+Caller protocol: run the default cheap profile, read and fix its actionable
+findings, and repeat on the current changes until every default reviewer says
+GO. Then explicitly run --premium. If premium finds blockers, fix them, restore
+cheap-profile GO on the current changes, and explicitly run --premium again.
 
-Reviewer permissions are a behavioral and resource boundary for trusted
-workspaces, not a hostile-code security sandbox. Reviewers may freely read and
-search the repository and use read-only Git commands, but may not edit files,
-run tests or builds, use the network, or delegate work.
+Cross-AI keeps no state and performs one pass only: it does not iterate, fix
+code, retain convergence state, perform automatic premium runs, or interpret
+GO/NO-GO as readiness. Exit 0 means only that every selected report was
+technically valid.
+Use --profile NAME for a named team, --reviewer for targeted work, --all for
+every configured reviewer, `cross-ai doctor` for runtime diagnostics, and
+`cross-ai --init-config` to create the one active configuration file.
 
-Use this review or planning loop:
-  1. Run without a profile flag to use the cheap reviewers.
-  2. Fix actionable findings and repeat the cheap review until both reviewers say GO.
-  3. Run --premium once as the final gate. It runs only the globally enabled
-     premium reviewers, so the already-green cheap review is not repeated.
-  4. If premium finds blockers, attach only the latest relevant premium reports
-     to the next cheap review. Fix the blockers and repeat the cheap loop until
-     both cheap reviewers say GO again.
-  5. Rerun --premium as the final gate after that new cheap GO. Do not accumulate
-     every historical report: keep only the reports needed to verify the current
-     remediation.
-  6. Proceed with implementation or shipping only after the latest premium
-     reviewers also say GO.
-
-Use --all only when you intentionally need every globally enabled reviewer in one fresh run.
-Use --reviewer for targeted diagnosis, rerunning a failed reviewer, or timing
-calibration. Premium models consume separate paid subscription quotas and should
-not be spent during the routine fix-and-review loop.
-
-Examples:
-  cross-ai --mode review --repo-root /path/to/project context.md
-  cross-ai --premium --mode review --repo-root /path/to/project context.md
-  cross-ai --all --mode review --repo-root /path/to/project context.md
-  cross-ai --reviewer claude-opus-5 --repo-root /path/to/project context.md
-  cross-ai --mode plan --repo-root /path/to/project requirements.md
+Reviewers may read and search the chosen repository and use read-only Git, but
+may not edit files, run tests or builds, access the network, or delegate work.
 """
 
-
-class DeepSeekV4ProReasoning(StrEnum):
-    MAX = "max"
-
-
-class Glm53Reasoning(StrEnum):
-    HIGH = "high"
-    MAX = "max"
-
-
-class ClaudeOpus5Reasoning(StrEnum):
-    LOW = "low"
-    MEDIUM = "medium"
-    HIGH = "high"
-    XHIGH = "xhigh"
-    MAX = "max"
-
-
-class CodexSolReasoning(StrEnum):
-    LOW = "low"
-    MEDIUM = "medium"
-    HIGH = "high"
-    XHIGH = "xhigh"
-    MAX = "max"
-    ULTRA = "ultra"
-
-
-type ModelReasoning = DeepSeekV4ProReasoning | Glm53Reasoning | ClaudeOpus5Reasoning | CodexSolReasoning
+CONFIG_FILE_NAME = "config.toml"
+TEMPLATE_FILE_NAME = "cross-ai.config.toml"
+CONFIG_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9-]*$")
+MODEL_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:+-]*$")
+REASONING_PATTERN = re.compile(r"^[a-z][a-z0-9_-]*$")
+KNOWN_RUNTIMES = frozenset(("opencode", "claude", "codex"))
+STANDARD_RUNTIME_PATHS = {
+    "opencode": Path.home() / ".opencode/bin/opencode",
+    "claude": Path.home() / ".local/bin/claude",
+    "codex": Path.home() / ".local/bin/codex",
+}
 
 
 @dataclass(frozen=True)
@@ -127,52 +89,28 @@ class ReviewerSpec:
     slug: str
     runtime: str
     model: str
-    reasoning: ModelReasoning | None = None
-    timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
-    enabled: bool = True
+    timeout_seconds: int
+    reasoning: str | None = None
 
 
-REVIEWER_SPECS = (
-    ReviewerSpec(
-        slug="deepseek-v4-pro",
-        runtime="opencode",
-        model="deepseek/deepseek-v4-pro",
-        reasoning=DeepSeekV4ProReasoning.MAX,
-        timeout_seconds=900,
-        enabled=True,
-    ),
-    ReviewerSpec(
-        slug="glm-5-3",
-        runtime="opencode",
-        model="zai-coding-plan/glm-5.3",
-        reasoning=Glm53Reasoning.MAX,
-        timeout_seconds=1800,
-        enabled=True,
-    ),
-    ReviewerSpec(
-        slug="claude-opus-5",
-        runtime="claude",
-        model="opus",
-        reasoning=ClaudeOpus5Reasoning.LOW,
-        timeout_seconds=1200,
-        enabled=True,
-    ),
-    ReviewerSpec(
-        slug="codex-sol-xhigh",
-        runtime="codex",
-        model="gpt-5.6-sol",
-        reasoning=CodexSolReasoning.XHIGH,
-        timeout_seconds=1800,
-        enabled=False,
-    ),
-)
-REVIEWER_REGISTRY = {reviewer.slug: reviewer for reviewer in REVIEWER_SPECS}
-REVIEW_PROFILES: dict[str, tuple[str, ...]] = {
-    "standard": ("deepseek-v4-pro", "glm-5-3"),
-    "premium": ("claude-opus-5", "codex-sol-xhigh"),
-    "all": tuple(REVIEWER_REGISTRY),
-}
-DEFAULT_PROFILE = "standard"
+@dataclass(frozen=True)
+class RuntimeSpec:
+    name: str
+    binary: str | None = None
+
+
+@dataclass(frozen=True)
+class CrossAIConfig:
+    path: Path
+    default_profile: str
+    default_timeout_seconds: int
+    runtimes: dict[str, RuntimeSpec]
+    profiles: dict[str, tuple[str, ...]]
+    reviewers: dict[str, ReviewerSpec]
+
+
+class ConfigurationError(ValueError):
+    """Raised when the active Cross-AI TOML configuration is invalid."""
 
 
 @dataclass(frozen=True)
@@ -233,7 +171,7 @@ class RunSummary:
     mode: str
     output_dir: Path
     server: OpenCodeServer | None
-    config_path: Path
+    opencode_config_path: Path
     context_files: tuple[Path, ...]
     results: list[ReviewResult]
     elapsed_seconds: float
@@ -246,7 +184,7 @@ class PreparedRun:
     mode: str
     output_dir: Path
     temporary_dir: Path
-    config_path: Path
+    opencode_config_path: Path
     context_files: tuple[Path, ...]
     prompt: str
     models: tuple[ReviewerSpec, ...]
@@ -345,84 +283,256 @@ def _opencode_permissions(repo_root: Path) -> dict[str, object]:
     }
 
 
-def _first_executable(*candidates: str | None) -> str | None:
+def _active_config_path() -> Path:
+    config_home = os.environ.get("XDG_CONFIG_HOME")
+    if config_home:
+        base = Path(config_home).expanduser()
+        if not base.is_absolute():
+            raise ConfigurationError("XDG_CONFIG_HOME must be an absolute path")
+    else:
+        base = Path.home() / ".config"
+    return base / "cross-ai" / CONFIG_FILE_NAME
+
+
+def _template_path() -> Path:
+    installed = Path(sysconfig.get_path("data")) / "share" / "cross-ai-review" / TEMPLATE_FILE_NAME
+    checkout = Path(__file__).with_name(TEMPLATE_FILE_NAME)
+    for candidate in (installed, checkout):
+        if candidate.is_file():
+            return candidate
+    raise ConfigurationError("shipped configuration template is unavailable; reinstall cross-ai-review")
+
+
+def _required_table(document: dict[str, object], key: str) -> dict[str, object]:
+    value = document.get(key)
+    if not isinstance(value, dict):
+        raise ConfigurationError(f"{key} must be a TOML table")
+    return value
+
+
+def _ensure_keys(table: dict[str, object], *, label: str, allowed: frozenset[str], required: frozenset[str]) -> None:
+    unknown = set(table).difference(allowed)
+    missing = required.difference(table)
+    if unknown:
+        raise ConfigurationError(f"{label} has unknown key(s): {', '.join(sorted(unknown))}")
+    if missing:
+        raise ConfigurationError(f"{label} is missing required key(s): {', '.join(sorted(missing))}")
+
+
+def _safe_name(value: object, *, label: str) -> str:
+    if not isinstance(value, str) or not CONFIG_NAME_PATTERN.fullmatch(value):
+        raise ConfigurationError(f"{label} must use lowercase letters, digits, and hyphens")
+    return value
+
+
+def _positive_int(value: object, *, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ConfigurationError(f"{label} must be a positive integer")
+    return value
+
+
+def _safe_model(value: object, *, label: str) -> str:
+    if not isinstance(value, str) or not MODEL_PATTERN.fullmatch(value):
+        raise ConfigurationError(f"{label} must be a safe non-empty model identifier")
+    return value
+
+
+def _safe_reasoning(value: object, *, label: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not REASONING_PATTERN.fullmatch(value):
+        raise ConfigurationError(f"{label} must be a safe reasoning identifier")
+    return value
+
+
+def _configured_binary(value: object, *, label: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ConfigurationError(f"{label} must be a string")
+    if not value:
+        raise ConfigurationError(f"{label} must be a non-empty absolute path")
+    if not Path(value).is_absolute():
+        raise ConfigurationError(f"{label} must be an absolute path: {value}")
+    return value
+
+
+def _parse_runtimes(runtime_table: dict[str, object]) -> dict[str, RuntimeSpec]:
+    runtimes: dict[str, RuntimeSpec] = {}
+    for name, raw_runtime in runtime_table.items():
+        runtime_name = _safe_name(name, label="runtime name")
+        if runtime_name not in KNOWN_RUNTIMES:
+            raise ConfigurationError(f"unsupported runtime: {runtime_name}")
+        if not isinstance(raw_runtime, dict):
+            raise ConfigurationError(f"runtimes.{runtime_name} must be a TOML table")
+        _ensure_keys(
+            raw_runtime, label=f"runtimes.{runtime_name}", allowed=frozenset(("binary",)), required=frozenset()
+        )
+        binary = _configured_binary(raw_runtime.get("binary"), label=f"runtimes.{runtime_name}.binary")
+        runtimes[runtime_name] = RuntimeSpec(runtime_name, binary)
+    if not runtimes:
+        raise ConfigurationError("runtimes must configure at least one runtime")
+    return runtimes
+
+
+def _parse_reviewers(
+    reviewer_table: dict[str, object], runtimes: dict[str, RuntimeSpec], default_timeout: int
+) -> dict[str, ReviewerSpec]:
+    reviewers: dict[str, ReviewerSpec] = {}
+    for slug, raw_reviewer in reviewer_table.items():
+        reviewer_slug = _safe_name(slug, label="reviewer name")
+        if not isinstance(raw_reviewer, dict):
+            raise ConfigurationError(f"reviewers.{reviewer_slug} must be a TOML table")
+        _ensure_keys(
+            raw_reviewer,
+            label=f"reviewers.{reviewer_slug}",
+            allowed=frozenset(("runtime", "model", "reasoning", "timeout_seconds")),
+            required=frozenset(("runtime", "model")),
+        )
+        runtime = _safe_name(raw_reviewer["runtime"], label=f"reviewers.{reviewer_slug}.runtime")
+        if runtime not in runtimes:
+            raise ConfigurationError(f"reviewers.{reviewer_slug} references unconfigured runtime: {runtime}")
+        timeout = _positive_int(
+            raw_reviewer.get("timeout_seconds", default_timeout), label=f"reviewers.{reviewer_slug}.timeout_seconds"
+        )
+        reviewers[reviewer_slug] = ReviewerSpec(
+            slug=reviewer_slug,
+            runtime=runtime,
+            model=_safe_model(raw_reviewer["model"], label=f"reviewers.{reviewer_slug}.model"),
+            reasoning=_safe_reasoning(raw_reviewer.get("reasoning"), label=f"reviewers.{reviewer_slug}.reasoning"),
+            timeout_seconds=timeout,
+        )
+    if not reviewers:
+        raise ConfigurationError("reviewers must configure at least one reviewer")
+    return reviewers
+
+
+def _parse_profiles(profile_table: dict[str, object], reviewers: dict[str, ReviewerSpec]) -> dict[str, tuple[str, ...]]:
+    profiles: dict[str, tuple[str, ...]] = {}
+    for name, raw_profile in profile_table.items():
+        profile_name = _safe_name(name, label="profile name")
+        if profile_name == "all":
+            raise ConfigurationError("profiles.all is reserved; --all selects every configured reviewer")
+        if not isinstance(raw_profile, dict):
+            raise ConfigurationError(f"profiles.{profile_name} must be a TOML table")
+        _ensure_keys(
+            raw_profile,
+            label=f"profiles.{profile_name}",
+            allowed=frozenset(("reviewers",)),
+            required=frozenset(("reviewers",)),
+        )
+        members = raw_profile["reviewers"]
+        if not isinstance(members, list) or not all(isinstance(member, str) for member in members):
+            raise ConfigurationError(f"profiles.{profile_name}.reviewers must be an array of reviewer names")
+        if not members:
+            raise ConfigurationError(f"profiles.{profile_name}.reviewers must not be empty")
+        if len(set(members)) != len(members):
+            raise ConfigurationError(f"profiles.{profile_name}.reviewers contains duplicates")
+        unknown_reviewers = set(members).difference(reviewers)
+        if unknown_reviewers:
+            raise ConfigurationError(
+                f"profiles.{profile_name} references unknown reviewer(s): {', '.join(sorted(unknown_reviewers))}"
+            )
+        profiles[profile_name] = tuple(members)
+    return profiles
+
+
+def _load_config(path: Path | None = None) -> CrossAIConfig:
+    config_path = path or _active_config_path()
+    if not config_path.is_file():
+        raise ConfigurationError(f"configuration file not found: {config_path}; run cross-ai --init-config")
+    try:
+        document = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise ConfigurationError(f"cannot read configuration {config_path}: {exc}") from None
+    if not isinstance(document, dict):
+        raise ConfigurationError("configuration root must be a TOML table")
+    _ensure_keys(
+        document,
+        label="configuration",
+        allowed=frozenset(("default_profile", "default_timeout_seconds", "runtimes", "profiles", "reviewers")),
+        required=frozenset(("default_profile", "default_timeout_seconds", "runtimes", "profiles", "reviewers")),
+    )
+    default_profile = _safe_name(document["default_profile"], label="default_profile")
+    default_timeout = _positive_int(document["default_timeout_seconds"], label="default_timeout_seconds")
+    runtimes = _parse_runtimes(_required_table(document, "runtimes"))
+    reviewers = _parse_reviewers(_required_table(document, "reviewers"), runtimes, default_timeout)
+    profiles = _parse_profiles(_required_table(document, "profiles"), reviewers)
+    if default_profile == "all" or default_profile not in profiles:
+        raise ConfigurationError(f"default_profile must name a configured non-all profile: {default_profile}")
+    return CrossAIConfig(config_path, default_profile, default_timeout, runtimes, profiles, reviewers)
+
+
+def _init_config() -> Path:
+    destination = _active_config_path()
+    template = _template_path()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with destination.open("x", encoding="utf-8") as handle:
+            handle.write(template.read_text(encoding="utf-8"))
+    except FileExistsError:
+        raise ConfigurationError(f"configuration already exists and was not overwritten: {destination}") from None
+    return destination
+
+
+def _first_executable(*candidates: Path | str | None) -> str | None:
     for candidate in candidates:
         if candidate and Path(candidate).is_file() and os.access(candidate, os.X_OK):
-            return candidate
+            return str(candidate)
     return None
 
 
-def _find_opencode() -> str:
-    candidate = _first_executable(
-        os.environ.get("OPENCODE_BIN"),
-        shutil.which("opencode"),
-        str(Path.home() / ".opencode/bin/opencode"),
-    )
+def _find_runtime(runtime: RuntimeSpec) -> str:
+    if runtime.binary is not None:
+        if not runtime.binary:
+            raise ConfigurationError(f"runtimes.{runtime.name}.binary must be a non-empty absolute executable")
+        configured = Path(runtime.binary)
+        if not configured.is_absolute():
+            raise ConfigurationError(f"runtimes.{runtime.name}.binary must be absolute: {runtime.binary}")
+        if not configured.is_file() or not os.access(configured, os.X_OK):
+            raise ConfigurationError(f"runtimes.{runtime.name}.binary is not an executable file: {runtime.binary}")
+        return str(configured)
+    candidate = _first_executable(STANDARD_RUNTIME_PATHS[runtime.name], shutil.which(runtime.name))
     if candidate is not None:
         return candidate
-    raise SystemExit("opencode binary not found. Set OPENCODE_BIN or install it at ~/.opencode/bin/opencode.")
+    raise ConfigurationError(f"{runtime.name} binary not found; configure runtimes.{runtime.name}.binary or install it")
 
 
-def _find_claude() -> str:
-    candidate = _first_executable(
-        os.environ.get("CLAUDE_BIN"),
-        shutil.which("claude"),
-        str(Path.home() / ".local/bin/claude"),
-    )
-    if candidate is not None:
-        return candidate
-    raise SystemExit("claude binary not found. Set CLAUDE_BIN or install Claude Code.")
+def _reviewers_for_profile(config: CrossAIConfig, profile: str) -> list[ReviewerSpec]:
+    return [config.reviewers[name] for name in config.profiles[profile]]
 
 
-def _find_codex() -> str:
-    candidate = _first_executable(
-        os.environ.get("CODEX_BIN"),
-        shutil.which("codex"),
-        str(Path.home() / ".local/bin/codex"),
-    )
-    if candidate is not None:
-        return candidate
-    raise SystemExit("codex binary not found. Set CODEX_BIN or install Codex CLI.")
-
-
-RUNTIME_FINDERS = {
-    "opencode": _find_opencode,
-    "claude": _find_claude,
-    "codex": _find_codex,
-}
-
-
-def _reviewers_for_profile(profile: str) -> list[ReviewerSpec]:
-    reviewer_names = REVIEW_PROFILES[profile]
-    unknown = set(reviewer_names).difference(REVIEWER_REGISTRY)
-    if unknown:
-        raise SystemExit(f"review profile {profile!r} references unknown reviewer(s): {', '.join(sorted(unknown))}")
-    return [REVIEWER_REGISTRY[name] for name in reviewer_names]
-
-
-def _selected_reviewers(args: argparse.Namespace) -> tuple[ReviewerSpec, ...]:
+def _selected_reviewers(args: argparse.Namespace, config: CrossAIConfig) -> tuple[ReviewerSpec, ...]:
     if args.reviewer:
-        reviewers = [REVIEWER_REGISTRY[name] for name in args.reviewer]
+        if len(set(args.reviewer)) != len(args.reviewer):
+            raise ConfigurationError("--reviewer cannot repeat the same reviewer slug")
+        unknown = set(args.reviewer).difference(config.reviewers)
+        if unknown:
+            raise ConfigurationError(f"unknown reviewer(s): {', '.join(sorted(unknown))}")
+        reviewers = [config.reviewers[name] for name in args.reviewer]
     else:
         if args.premium:
             profile = "premium"
         elif args.all:
-            profile = "all"
+            reviewers = list(config.reviewers.values())
+            return tuple(reviewers)
         else:
-            profile = DEFAULT_PROFILE
-        reviewers = _reviewers_for_profile(profile)
-    selected = tuple(reviewer for reviewer in reviewers if reviewer.enabled)
-    if not selected:
-        raise SystemExit("no reviewers are enabled; set enabled=True for at least one REVIEWER_REGISTRY profile")
-    return selected
+            profile = args.profile or config.default_profile
+        if profile not in config.profiles:
+            raise ConfigurationError(f"unknown profile: {profile}")
+        reviewers = _reviewers_for_profile(config, profile)
+    return tuple(reviewers)
 
 
-def _runtime_bins(reviewers: tuple[ReviewerSpec, ...]) -> dict[str, str]:
+def _premium_focus(args: argparse.Namespace, config: CrossAIConfig) -> bool:
+    if args.reviewer or args.all:
+        return False
+    return args.premium or (args.profile or config.default_profile) == "premium"
+
+
+def _runtime_bins(config: CrossAIConfig, reviewers: tuple[ReviewerSpec, ...]) -> dict[str, str]:
     runtimes = {reviewer.runtime for reviewer in reviewers}
-    unknown = runtimes.difference(RUNTIME_FINDERS)
-    if unknown:
-        raise SystemExit(f"unsupported reviewer runtime(s): {', '.join(sorted(unknown))}")
-    return {runtime: RUNTIME_FINDERS[runtime]() for runtime in runtimes}
+    return {runtime: _find_runtime(config.runtimes[runtime]) for runtime in runtimes}
 
 
 def _create_run_directory(output_root: Path) -> Path:
@@ -517,7 +627,7 @@ def _copy_context_files(files: list[Path], output_dir: Path) -> tuple[Path, ...]
 
 
 def _write_opencode_config(output_dir: Path, repo_root: Path) -> Path:
-    config_path = output_dir / "opencode.json"
+    opencode_config_path = output_dir / "opencode.json"
     permissions = _opencode_permissions(repo_root)
     config = {
         "$schema": "https://opencode.ai/config.json",
@@ -529,20 +639,20 @@ def _write_opencode_config(output_dir: Path, repo_root: Path) -> Path:
             }
         },
     }
-    config_path.write_text(
+    opencode_config_path.write_text(
         json.dumps(config, indent=2) + "\n",
         encoding="utf-8",
     )
-    return config_path
+    return opencode_config_path
 
 
 def _opencode_environment(
-    config_path: Path,
+    opencode_config_path: Path,
     temporary_dir: Path,
 ) -> dict[str, str]:
     env = os.environ.copy()
     env.setdefault("NO_COLOR", "1")
-    env["OPENCODE_CONFIG"] = str(config_path)
+    env["OPENCODE_CONFIG"] = str(opencode_config_path)
     env["TMPDIR"] = str(temporary_dir)
     env["BUN_TMPDIR"] = str(temporary_dir)
     return env
@@ -647,20 +757,6 @@ def _extract_final_review_text(stdout: bytes) -> str:
     return final_text
 
 
-def _validate_review_output(
-    stdout: bytes, *, min_output_chars: int, require_review_markers: bool
-) -> tuple[str | None, str | None]:
-    try:
-        final_text = _validate_final_review_text(
-            _extract_final_review_text(stdout),
-            min_output_chars=min_output_chars,
-            require_review_markers=require_review_markers,
-        )
-    except ValueError as exc:
-        return None, str(exc)
-    return final_text, None
-
-
 def _validate_final_review_text(final_text: str, *, min_output_chars: int, require_review_markers: bool) -> str:
     if len(final_text) < min_output_chars:
         raise ValueError(
@@ -694,7 +790,7 @@ async def _start_opencode_server(
     opencode_bin: str,
     repo_root: Path,
     output_dir: Path,
-    config_path: Path,
+    opencode_config_path: Path,
     temporary_dir: Path,
     timeout_seconds: int = 30,
 ) -> OpenCodeServer:
@@ -712,7 +808,7 @@ async def _start_opencode_server(
         "--log-level",
         "INFO",
     ]
-    env = _opencode_environment(config_path, temporary_dir)
+    env = _opencode_environment(opencode_config_path, temporary_dir)
     with log_path.open("wb") as log_handle:
         log_handle.write(
             (
@@ -787,7 +883,7 @@ def _opencode_review_command(request: ReviewRequest, *, attach_url: str | None) 
     command.extend(["--agent", "plan"])
     command.extend(["--format", "json"])
     if review_model.reasoning:
-        command.extend(["--variant", review_model.reasoning.value])
+        command.extend(["--variant", review_model.reasoning])
     if attach_url is not None:
         command.extend(["--attach", attach_url])
     command.extend(["--dir", str(request.repo_root)])
@@ -819,7 +915,7 @@ def _claude_review_command(request: ReviewRequest) -> list[str]:
         "json",
     ]
     if request.review_model.reasoning:
-        command.extend(["--effort", request.review_model.reasoning.value])
+        command.extend(["--effort", request.review_model.reasoning])
     return command
 
 
@@ -842,7 +938,7 @@ def _codex_review_command(request: ReviewRequest) -> list[str]:
         command.extend(
             [
                 "--config",
-                f'model_reasoning_effort="{request.review_model.reasoning.value}"',
+                f'model_reasoning_effort="{request.review_model.reasoning}"',
             ]
         )
     command.append(prompt)
@@ -914,11 +1010,13 @@ def _validate_runtime_output(request: ReviewRequest, stdout: bytes) -> tuple[str
     return final_text, None
 
 
-async def _review_attempt(request: ReviewRequest, *, attach_url: str | None, config_path: Path) -> ReviewAttempt:
+async def _review_attempt(
+    request: ReviewRequest, *, attach_url: str | None, opencode_config_path: Path
+) -> ReviewAttempt:
     command = _review_command(request, attach_url=attach_url)
 
     env = (
-        _opencode_environment(config_path, request.temporary_dir)
+        _opencode_environment(opencode_config_path, request.temporary_dir)
         if request.review_model.runtime == "opencode"
         else os.environ.copy()
     )
@@ -962,12 +1060,12 @@ async def _review_attempt(request: ReviewRequest, *, attach_url: str | None, con
     )
 
 
-async def _collect_review_attempts(request: ReviewRequest, *, config_path: Path) -> list[ReviewAttempt]:
+async def _collect_review_attempts(request: ReviewRequest, *, opencode_config_path: Path) -> list[ReviewAttempt]:
     attempts = [
         await _review_attempt(
             request,
             attach_url=request.attach_url,
-            config_path=config_path,
+            opencode_config_path=opencode_config_path,
         )
     ]
     if (
@@ -976,7 +1074,7 @@ async def _collect_review_attempts(request: ReviewRequest, *, config_path: Path)
         and attempts[0].returncode == 0
         and attempts[0].validation_error is not None
     ):
-        attempts.append(await _review_attempt(request, attach_url=None, config_path=config_path))
+        attempts.append(await _review_attempt(request, attach_url=None, opencode_config_path=opencode_config_path))
     return attempts
 
 
@@ -1038,9 +1136,9 @@ def _write_review_result(
         handle.write(_review_result_body(request, attempt, valid_output=valid_output))
 
 
-async def _run_review(request: ReviewRequest, *, config_path: Path) -> ReviewResult:
+async def _run_review(request: ReviewRequest, *, opencode_config_path: Path) -> ReviewResult:
     started_at = monotonic()
-    attempts = await _collect_review_attempts(request, config_path=config_path)
+    attempts = await _collect_review_attempts(request, opencode_config_path=opencode_config_path)
     attempt = attempts[-1]
     returncode = _result_returncode(attempt)
     valid_output = returncode == 0 and attempt.validation_error is None
@@ -1069,8 +1167,14 @@ def _resolve_output_root(repo_root: Path, output_dir: str) -> Path:
     return output_root
 
 
-def _build_prompt(mode: str, goal: str | None, repo_root: Path) -> str:
+def _build_prompt(mode: str, goal: str | None, repo_root: Path, *, premium: bool = False) -> str:
     prompt = DEFAULT_REVIEW_PROMPT if mode == "review" else DEFAULT_PLAN_PROMPT
+    if premium:
+        prompt = (
+            f"{prompt}\n\n"
+            "Premium strategic focus: assess long-term architecture, product consequences, maintainability, "
+            "and decisions that would be difficult to reverse."
+        )
     if goal:
         prompt = f"Goal / decision to support: {goal}\n\n{prompt}"
     return f"{prompt}\n\n{_execution_guardrails(repo_root, mode)}"
@@ -1097,7 +1201,7 @@ def _write_run_summary(
         server_log = summary.server.log_path if summary.server else "not started (direct mode)"
         handle.write(f"- execution mode: `{'shared' if summary.server else 'direct'}`\n")
         handle.write(f"- shared opencode server: `{server_log}`\n")
-        handle.write(f"- OpenCode permission config: `{summary.config_path}`\n")
+        handle.write(f"- generated OpenCode permission config: `{summary.opencode_config_path}`\n")
         handle.write("- context files:\n")
         for file_path in summary.context_files:
             handle.write(f"  - `{file_path}`\n")
@@ -1140,16 +1244,21 @@ def _print_run_summary(
     sys.stdout.write(f"- total wall time: {_format_duration(elapsed_seconds)}\n")
 
 
-def _prepare_run(args: argparse.Namespace, *, temporary_dir: Path) -> PreparedRun:
+def _prepare_run(
+    args: argparse.Namespace,
+    models: tuple[ReviewerSpec, ...],
+    runtime_bins: dict[str, str],
+    premium_focus: bool,
+    *,
+    temporary_dir: Path,
+) -> PreparedRun:
     repo_root = _existing_directory(args.repo_root, label="repository root")
     raw_files = [_existing_file(path, label="context file") for path in args.context_file]
     output_root = _resolve_output_root(repo_root, args.output_dir)
-    models = _selected_reviewers(args)
-    runtime_bins = _runtime_bins(models)
-    prompt = _build_prompt(args.mode, args.goal, repo_root)
+    prompt = _build_prompt(args.mode, args.goal, repo_root, premium=premium_focus)
 
     output_dir = _create_run_directory(output_root)
-    config_path = _write_opencode_config(output_dir, repo_root)
+    opencode_config_path = _write_opencode_config(output_dir, repo_root)
     context_files = _copy_context_files(raw_files, output_dir)
     return PreparedRun(
         runtime_bins=runtime_bins,
@@ -1157,7 +1266,7 @@ def _prepare_run(args: argparse.Namespace, *, temporary_dir: Path) -> PreparedRu
         mode=args.mode,
         output_dir=output_dir,
         temporary_dir=temporary_dir,
-        config_path=config_path,
+        opencode_config_path=opencode_config_path,
         context_files=context_files,
         prompt=prompt,
         models=models,
@@ -1175,14 +1284,14 @@ def _print_startup(run: PreparedRun) -> None:
         sys.stdout.write(
             f"- reviewer: {model.slug}; runtime={model.runtime}; "
             f"model={model.model}:"
-            f"{model.reasoning.value if model.reasoning else 'default'}; "
+            f"{model.reasoning or 'default'}; "
             f"timeout={model.timeout_seconds}s\n"
         )
     sys.stdout.flush()
 
 
-def _reviewer_profile_names(reviewer_slug: str) -> str:
-    profiles = [profile for profile, reviewer_slugs in REVIEW_PROFILES.items() if reviewer_slug in reviewer_slugs]
+def _reviewer_profile_names(config: CrossAIConfig, reviewer_slug: str) -> str:
+    profiles = [profile for profile, reviewer_slugs in config.profiles.items() if reviewer_slug in reviewer_slugs]
     return ",".join(profiles) or "-"
 
 
@@ -1192,10 +1301,9 @@ def _format_timeout(seconds: int) -> str:
     return f"{seconds}s"
 
 
-def _reviewer_registry_table() -> str:
+def _reviewer_registry_table(config: CrossAIConfig) -> str:
     headers = (
         "reviewer",
-        "state",
         "profiles",
         "runtime",
         "model",
@@ -1205,14 +1313,13 @@ def _reviewer_registry_table() -> str:
     rows = [
         (
             reviewer.slug,
-            "on" if reviewer.enabled else "off",
-            _reviewer_profile_names(reviewer.slug),
+            _reviewer_profile_names(config, reviewer.slug),
             reviewer.runtime,
             reviewer.model,
-            reviewer.reasoning.value if reviewer.reasoning else "default",
+            reviewer.reasoning or "default",
             _format_timeout(reviewer.timeout_seconds),
         )
-        for reviewer in REVIEWER_REGISTRY.values()
+        for reviewer in config.reviewers.values()
     ]
     widths = [max(len(header), *(len(row[index]) for row in rows)) for index, header in enumerate(headers)]
     lines = [
@@ -1230,7 +1337,7 @@ async def _start_run_server(run: PreparedRun) -> OpenCodeServer | None:
         opencode_bin=run.runtime_bins["opencode"],
         repo_root=run.repo_root,
         output_dir=run.output_dir,
-        config_path=run.config_path,
+        opencode_config_path=run.opencode_config_path,
         temporary_dir=run.temporary_dir,
     )
 
@@ -1251,7 +1358,7 @@ def _review_tasks(run: PreparedRun, server: OpenCodeServer | None) -> list[Corou
                 min_output_chars=DEFAULT_MIN_OUTPUT_CHARS,
                 require_review_markers=run.mode == "review",
             ),
-            config_path=run.config_path,
+            opencode_config_path=run.opencode_config_path,
         )
         for review_model in run.models
     ]
@@ -1296,7 +1403,7 @@ def _finish_run(
             mode=run.mode,
             output_dir=run.output_dir,
             server=server,
-            config_path=run.config_path,
+            opencode_config_path=run.opencode_config_path,
             context_files=run.context_files,
             results=results,
             elapsed_seconds=elapsed_seconds,
@@ -1351,7 +1458,12 @@ async def _execute_with_temporary_limit(
         await asyncio.gather(run_task, monitor_task, return_exceptions=True)
 
 
-async def _main_async(args: argparse.Namespace) -> int:
+async def _main_async(
+    args: argparse.Namespace,
+    models: tuple[ReviewerSpec, ...],
+    runtime_bins: dict[str, str],
+    premium_focus: bool,
+) -> int:
     loop = asyncio.get_running_loop()
     main_task = asyncio.current_task()
     if main_task is None:
@@ -1371,7 +1483,7 @@ async def _main_async(args: argparse.Namespace) -> int:
             registered_signals.append(signum)
         temporary_dir = _create_temporary_directory()
         started_at = monotonic()
-        run = _prepare_run(args, temporary_dir=temporary_dir)
+        run = _prepare_run(args, models, runtime_bins, premium_focus, temporary_dir=temporary_dir)
         _print_startup(run)
         return await _execute_with_temporary_limit(run, started_at=started_at)
     except asyncio.CancelledError:
@@ -1395,7 +1507,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "context_file",
-        nargs="+",
+        nargs="*",
         help="Context file(s) to attach to every selected reviewer.",
     )
     parser.add_argument(
@@ -1404,7 +1516,6 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--repo-root",
-        required=True,
         help="Exact existing project directory used for both OpenCode cwd and --dir.",
     )
     parser.add_argument(
@@ -1423,7 +1534,6 @@ def _build_parser() -> argparse.ArgumentParser:
         "--reviewer",
         action="append",
         default=None,
-        choices=tuple(REVIEWER_REGISTRY),
         metavar="SLUG",
         help=(
             "Run only this registered reviewer. Repeat for multiple reviewers. "
@@ -1433,12 +1543,22 @@ def _build_parser() -> argparse.ArgumentParser:
     reviewer_selection.add_argument(
         "--premium",
         action="store_true",
-        help=("Run the globally enabled premium final-gate reviewers. Use after the default cheap reviewers say GO."),
+        help="Run the configured premium profile.",
     )
     reviewer_selection.add_argument(
         "--all",
         action="store_true",
-        help="Run every globally enabled standard and premium reviewer in one intentional full pass.",
+        help="Run every configured reviewer in one intentional full pass.",
+    )
+    reviewer_selection.add_argument(
+        "--profile",
+        metavar="NAME",
+        help="Run one named configured profile.",
+    )
+    parser.add_argument(
+        "--init-config",
+        action="store_true",
+        help="Create the active XDG configuration from the shipped template without overwriting it.",
     )
     parser.add_argument(
         "--no-shared-server",
@@ -1448,23 +1568,87 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _parse_args(parser: argparse.ArgumentParser | None = None) -> argparse.Namespace:
-    return (parser or _build_parser()).parse_args()
+def _parse_args(argv: list[str], parser: argparse.ArgumentParser | None = None) -> argparse.Namespace:
+    return (parser or _build_parser()).parse_args(argv)
+
+
+def _build_doctor_parser() -> argparse.ArgumentParser:
+    return argparse.ArgumentParser(description="Check Cross-AI configuration and configured runtime binaries.")
+
+
+def _validate_run_arguments(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    if not args.repo_root:
+        parser.error("--repo-root is required for a review or planning run")
+    if not args.context_file:
+        parser.error("at least one context file is required for a review or planning run")
+
+
+def _doctor(config: CrossAIConfig) -> int:
+    sys.stdout.write(f"Cross-AI configuration: {config.path}\n")
+    sys.stdout.write(f"Default profile: {config.default_profile}\n")
+    unavailable = False
+    for runtime in config.runtimes.values():
+        try:
+            binary = _find_runtime(runtime)
+        except ConfigurationError as exc:
+            unavailable = True
+            sys.stdout.write(f"Runtime {runtime.name}: unavailable ({exc})\n")
+        else:
+            sys.stdout.write(f"Runtime {runtime.name}: {binary}\n")
+    profiled = {reviewer for members in config.profiles.values() for reviewer in members}
+    orphans = sorted(set(config.reviewers).difference(profiled))
+    if orphans:
+        sys.stdout.write(f"Warning: orphan reviewers selectable with --reviewer/--all: {', '.join(orphans)}\n")
+    sys.stdout.write(f"\n{_reviewer_registry_table(config)}\n")
+    return 1 if unavailable else 0
+
+
+def _dispatch(argv: list[str]) -> int:
+    if not argv:
+        parser = _build_parser()
+        sys.stdout.write(MENTAL_MODEL)
+        sys.stdout.write("\n")
+        sys.stdout.write(parser.format_help())
+        return 0
+    if argv[0] == "doctor":
+        _build_doctor_parser().parse_args(argv[1:])
+        return _doctor(_load_config())
+    parser = _build_parser()
+    args = _parse_args(argv, parser)
+    if args.init_config:
+        if (
+            args.context_file
+            or args.repo_root
+            or args.goal
+            or args.mode != "review"
+            or args.output_dir != DEFAULT_OUTPUT_DIR
+            or args.reviewer
+            or args.premium
+            or args.all
+            or args.profile
+            or args.no_shared_server
+        ):
+            parser.error("--init-config cannot be combined with review or planning arguments")
+        destination = _init_config()
+        sys.stdout.write(f"Created Cross-AI configuration: {destination}\n")
+        return 0
+    _validate_run_arguments(args, parser)
+    config = _load_config()
+    models = _selected_reviewers(args, config)
+    runtime_bins = _runtime_bins(config, models)
+    premium_focus = _premium_focus(args, config)
+    sys.stdout.write(f"Starting cross-ai in {args.mode} mode. Run cross-ai without arguments for usage guidance.\n")
+    sys.stdout.flush()
+    return asyncio.run(_main_async(args, models, runtime_bins, premium_focus))
 
 
 def main() -> int:
-    parser = _build_parser()
-    if len(sys.argv) == 1:
-        sys.stdout.write(MENTAL_MODEL)
-        sys.stdout.write("\nConfigured reviewers:\n\n")
-        sys.stdout.write(f"{_reviewer_registry_table()}\n\n")
-        sys.stdout.write(parser.format_help())
-        return 0
-    args = _parse_args(parser)
-    sys.stdout.write(f"Starting cross-ai in {args.mode} mode. Run cross-ai without arguments for usage guidance.\n")
-    sys.stdout.flush()
     try:
-        return asyncio.run(_main_async(args))
+        return _dispatch(sys.argv[1:])
+    except ConfigurationError as exc:
+        sys.stderr.write(f"Cross-AI configuration error: {exc}\n")
+        sys.stderr.flush()
+        return 2
     except TemporaryDirectoryLimitExceeded as exc:
         sys.stderr.write(f"Cross-AI stopped: {exc}\n")
         sys.stderr.flush()
