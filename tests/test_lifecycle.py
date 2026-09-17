@@ -151,6 +151,31 @@ def test_temp_environment_limit_and_cleanup() -> None:
     assert not path.exists()
 
 
+def test_temp_monitor_removes_only_stale_bun_artifacts() -> None:
+    path = cross_ai._create_temporary_directory()
+    try:
+        stale_bun = path / ".9adf5afbebf9ef97-00000000.so"
+        fresh_bun = path / ".9adf5afbebf9ef98-00000000.so"
+        unrelated = path / "oversized.so"
+        stale_bun.write_bytes(b"xx")
+        fresh_bun.write_bytes(b"xx")
+        unrelated.write_bytes(b"xx")
+        old = time.time() - cross_ai.OPENCODE_BUN_ARTIFACT_GRACE_SECONDS - 1
+        os.utime(stale_bun, (old, old))
+        os.utime(unrelated, (old, old))
+
+        cross_ai._remove_stale_bun_artifacts(
+            path,
+            older_than=cross_ai.OPENCODE_BUN_ARTIFACT_GRACE_SECONDS,
+        )
+
+        assert not stale_bun.exists()
+        assert fresh_bun.exists()
+        assert unrelated.exists()
+    finally:
+        cross_ai._remove_temporary_directory(path)
+
+
 def test_success_preserves_report_and_removes_run_temp(tmp_path: Path) -> None:
     before = set(Path("/tmp").glob(f"cross-ai-{os.getuid()}-*"))
     fake = tmp_path / "opencode"

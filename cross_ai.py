@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from http import HTTPStatus
 from pathlib import Path
-from time import monotonic
+from time import monotonic, time
 
 DEFAULT_REVIEW_PROMPT = (
     "Adversarially review the attached context. Focus on correctness, design fit, "
@@ -45,6 +45,8 @@ DEFAULT_OUTPUT_DIR = ".adversarial-reviews"
 OPENCODE_TEMP_ROOT = "/tmp"
 OPENCODE_TEMP_LIMIT_BYTES = 2 * 1024**3
 OPENCODE_TEMP_POLL_SECONDS = 1.0
+OPENCODE_BUN_ARTIFACT_GRACE_SECONDS = 60.0
+OPENCODE_BUN_ARTIFACT_PATTERN = re.compile(r"^\.[0-9a-f]+-\d{8}\.so$")
 PROCESS_TERMINATION_GRACE_SECONDS = 3.0
 TERMINATION_SIGNALS = (signal.SIGHUP, signal.SIGTERM, signal.SIGQUIT)
 REVIEW_MARKER_PATTERN = re.compile(
@@ -591,8 +593,25 @@ def _temporary_directory_size(path: Path) -> int:
     return total
 
 
+def _remove_stale_bun_artifacts(path: Path, *, older_than: float) -> None:
+    cutoff = time() - older_than
+    for candidate in path.iterdir():
+        if not OPENCODE_BUN_ARTIFACT_PATTERN.fullmatch(candidate.name):
+            continue
+        try:
+            metadata = candidate.lstat()
+            if stat.S_ISREG(metadata.st_mode) and metadata.st_mtime <= cutoff:
+                candidate.unlink()
+        except FileNotFoundError:
+            continue
+
+
 async def _monitor_temporary_directory(path: Path, *, limit_bytes: int) -> None:
     while True:
+        _remove_stale_bun_artifacts(
+            path,
+            older_than=OPENCODE_BUN_ARTIFACT_GRACE_SECONDS,
+        )
         size_bytes = _temporary_directory_size(path)
         if size_bytes > limit_bytes:
             raise TemporaryDirectoryLimitExceeded(
