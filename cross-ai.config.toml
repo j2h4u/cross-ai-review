@@ -11,7 +11,7 @@ default_timeout_seconds = 900
 reviewers = ["deepseek-v4-1-flash", "glm-5-3"]
 
 [profiles.premium]
-reviewers = ["claude-opus-5"]
+reviewers = ["claude-opus-5", "codex-astra-high"]
 
 [reviewers.deepseek-v4-1-flash]
 runtime = "opencode"
@@ -35,8 +35,8 @@ model = "opus"
 reasoning = "low"
 timeout_seconds = 1200
 
-[reviewers.codex-sol-xhigh]
+[reviewers.codex-astra-high]
 runtime = "codex"
-model = "gpt-5.6-sol"
-reasoning = "xhigh"
+model = "gpt-6-astra"
+reasoning = "high"
 timeout_seconds = 1800
