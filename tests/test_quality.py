@@ -19,7 +19,8 @@ def request(root: Path, runtime: str = "codex") -> cross_ai.ReviewRequest:
         output_dir=root,
         temporary_dir=root,
         timeout_seconds=1,
-        attach_url=None,
+        server_url=None,
+        server_password=None,
         min_output_chars=5,
         require_review_markers=False,
     )
@@ -97,47 +98,51 @@ def test_bash_permission_failure_accepts_only_permission_errors() -> None:
     )
 
 
-def test_shared_opencode_invalid_output_retries_directly(tmp_path: Path) -> None:
+def test_shared_opencode_invalid_output_retries_standalone(tmp_path: Path) -> None:
     calls: list[str | None] = []
 
     async def attempt(
-        current: cross_ai.ReviewRequest, *, attach_url: str | None, opencode_config_path: Path
+        current: cross_ai.ReviewRequest, *, server_url: str | None, opencode_config_path: Path
     ) -> cross_ai.ReviewAttempt:
         del current, opencode_config_path
-        calls.append(attach_url)
-        shared = attach_url is not None
+        calls.append(server_url)
+        shared = server_url is not None
         return cross_ai.ReviewAttempt(
-            command=["fake", "shared" if shared else "direct"],
+            command=["fake", "shared" if shared else "standalone"],
             stdout=b"",
             timed_out=False,
             returncode=0,
-            final_text=None if shared else "Finding: direct retry",
+            final_text=None if shared else "Finding: standalone retry",
             validation_error="shared output invalid" if shared else None,
             permission_denials=(),
-            mode="shared" if shared else "direct",
+            mode="shared" if shared else "standalone",
         )
 
     current = cross_ai.ReviewRequest(
-        **{**request(tmp_path, "opencode").__dict__, "attach_url": "http://127.0.0.1:1234"}
+        **{
+            **request(tmp_path, "opencode").__dict__,
+            "server_url": "http://127.0.0.1:1234",
+            "server_password": "test-password",
+        }
     )
     with mock.patch.object(cross_ai, "_review_attempt", side_effect=attempt):
         attempts = asyncio.run(cross_ai._collect_review_attempts(current, opencode_config_path=tmp_path / "config"))
     assert calls == ["http://127.0.0.1:1234", None]
-    assert [item.mode for item in attempts] == ["shared", "direct"]
-    assert attempts[-1].final_text == "Finding: direct retry"
+    assert [item.mode for item in attempts] == ["shared", "standalone"]
+    assert attempts[-1].final_text == "Finding: standalone retry"
 
 
 def test_review_report_keeps_retry_diagnostics(tmp_path: Path) -> None:
     current = request(tmp_path, "opencode")
     attempts = [
         cross_ai.ReviewAttempt(["fake", "shared"], b"raw", False, 0, None, "invalid shared", (), "shared"),
-        cross_ai.ReviewAttempt(["fake", "direct"], b"raw", False, 0, "Finding: final", None, (), "direct"),
+        cross_ai.ReviewAttempt(["fake", "standalone"], b"raw", False, 0, "Finding: final", None, (), "standalone"),
     ]
     with mock.patch.object(cross_ai, "_collect_review_attempts", return_value=attempts):
         result = asyncio.run(cross_ai._run_review(current, opencode_config_path=tmp_path / "config"))
     report = (tmp_path / "opencode.md").read_text(encoding="utf-8")
     assert result.valid_output
-    assert "A direct retry was performed" in report
+    assert "A standalone retry was performed" in report
     assert "Finding: final" in report
 
 
@@ -205,6 +210,21 @@ def test_permission_policy_and_summary_preserve_contract(tmp_path: Path) -> None
     text = path.read_text(encoding="utf-8")
     assert "invalid output (bad)" in text
     assert "denied command" in text
+    assert "execution mode: `runtime-native`" in text
+
+
+def test_execution_mode_distinguishes_opencode_native_and_mixed() -> None:
+    assert cross_ai._execution_mode(("opencode",), shared_opencode=True) == "shared"
+    assert cross_ai._execution_mode(("opencode",), shared_opencode=False) == "standalone"
+    assert cross_ai._execution_mode(("claude", "codex"), shared_opencode=False) == "runtime-native"
+    assert (
+        cross_ai._execution_mode(("opencode", "claude"), shared_opencode=True)
+        == "mixed (shared OpenCode + runtime-native)"
+    )
+    assert (
+        cross_ai._execution_mode(("opencode", "codex"), shared_opencode=False)
+        == "mixed (standalone OpenCode + runtime-native)"
+    )
 
 
 def test_review_attempt_success_timeout_and_exception(tmp_path: Path) -> None:
@@ -224,11 +244,45 @@ def test_review_attempt_success_timeout_and_exception(tmp_path: Path) -> None:
 
     with mock.patch.object(asyncio, "create_subprocess_exec", return_value=Process(opencode_output("Finding: answer"))):
         attempt = asyncio.run(
-            cross_ai._review_attempt(current, attach_url=None, opencode_config_path=tmp_path / "config")
+            cross_ai._review_attempt(current, server_url=None, opencode_config_path=tmp_path / "config")
         )
     assert attempt.returncode == 0
     assert attempt.final_text == "Finding: answer"
+
+    secret_request = cross_ai.ReviewRequest(
+        **{
+            **current.__dict__,
+            "server_url": "http://127.0.0.1:1234",
+            "server_password": "shared-secret",
+        }
+    )
+    secret_output = opencode_output("Finding: answer contained shared-secret")
+    with mock.patch.object(asyncio, "create_subprocess_exec", return_value=Process(secret_output)):
+        attempt = asyncio.run(
+            cross_ai._review_attempt(
+                secret_request,
+                server_url=secret_request.server_url,
+                opencode_config_path=tmp_path / "config",
+            )
+        )
+    assert b"shared-secret" not in attempt.stdout
+    assert attempt.final_text == "Finding: answer contained <redacted>"
     assert not attempt.timed_out
+
+    native_request = request(tmp_path, "codex")
+    with mock.patch.object(
+        asyncio,
+        "create_subprocess_exec",
+        return_value=Process(codex_output("Finding: native answer")),
+    ):
+        attempt = asyncio.run(
+            cross_ai._review_attempt(
+                native_request,
+                server_url=None,
+                opencode_config_path=tmp_path / "config",
+            )
+        )
+    assert attempt.mode == "runtime-native"
 
     timed = Process(TimeoutError(), opencode_output("Finding: recovered"))
     with (
@@ -236,7 +290,7 @@ def test_review_attempt_success_timeout_and_exception(tmp_path: Path) -> None:
         mock.patch.object(cross_ai, "_terminate_process", new_callable=mock.AsyncMock) as terminate,
     ):
         attempt = asyncio.run(
-            cross_ai._review_attempt(current, attach_url=None, opencode_config_path=tmp_path / "config")
+            cross_ai._review_attempt(current, server_url=None, opencode_config_path=tmp_path / "config")
         )
     assert attempt.timed_out
     assert attempt.returncode == 124
@@ -249,7 +303,7 @@ def test_review_attempt_success_timeout_and_exception(tmp_path: Path) -> None:
         mock.patch.object(cross_ai, "_terminate_process", new_callable=mock.AsyncMock) as terminate,
         pytest.raises(RuntimeError, match="broken process"),
     ):
-        asyncio.run(cross_ai._review_attempt(current, attach_url=None, opencode_config_path=tmp_path / "config"))
+        asyncio.run(cross_ai._review_attempt(current, server_url=None, opencode_config_path=tmp_path / "config"))
     terminate.assert_awaited_once_with(failed)
 
 
@@ -276,6 +330,42 @@ def test_execute_reviews_orders_and_reports_invalid_results(tmp_path: Path, caps
     output = capsys.readouterr().out
     assert "status=valid" in output
     assert "status=invalid" in output
+
+
+def test_review_tasks_scope_shared_credentials_to_opencode(tmp_path: Path) -> None:
+    models = (
+        cross_ai.ReviewerSpec("oc", "opencode", "provider/model", 1, "max"),
+        cross_ai.ReviewerSpec("native", "codex", "gpt-test", 2, "high"),
+    )
+    run = cross_ai.PreparedRun(
+        {"opencode": "/bin/opencode", "codex": "/bin/codex"},
+        tmp_path,
+        "review",
+        tmp_path,
+        tmp_path,
+        tmp_path / "config",
+        (),
+        "prompt",
+        models,
+        True,
+    )
+    server = mock.Mock(url="http://127.0.0.1:1234", password="shared-secret")
+
+    async def collect_requests() -> list[cross_ai.ReviewRequest]:
+        with mock.patch.object(
+            cross_ai,
+            "_run_review",
+            new_callable=mock.AsyncMock,
+            return_value=result(tmp_path, "done"),
+        ) as run_review:
+            await asyncio.gather(*cross_ai._review_tasks(run, server))
+        return [call.args[0] for call in run_review.await_args_list]
+
+    requests = asyncio.run(collect_requests())
+    opencode, native = requests
+    assert (opencode.server_url, opencode.server_password) == (server.url, server.password)
+    assert (native.server_url, native.server_password) == (None, None)
+    assert opencode.require_review_markers and native.require_review_markers
 
 
 def test_main_async_success_cleans_temporary_directory(tmp_path: Path) -> None:

@@ -10,6 +10,7 @@ import http.client
 import json
 import os
 import re
+import secrets
 import shlex
 import shutil
 import signal
@@ -19,8 +20,8 @@ import sys
 import sysconfig
 import tempfile
 import tomllib
-from collections.abc import Coroutine
-from dataclasses import dataclass
+from collections.abc import Coroutine, Iterable
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from http import HTTPStatus
 from pathlib import Path
@@ -136,7 +137,8 @@ class ReviewRequest:
     output_dir: Path
     temporary_dir: Path
     timeout_seconds: int
-    attach_url: str | None
+    server_url: str | None
+    server_password: str | None = field(repr=False)
     min_output_chars: int
     require_review_markers: bool
 
@@ -165,6 +167,8 @@ class OpenCodeServer:
     process: asyncio.subprocess.Process
     url: str
     log_path: Path
+    password: str = field(repr=False)
+    log_task: asyncio.Task[None]
 
 
 @dataclass(frozen=True)
@@ -216,6 +220,16 @@ def _format_duration(seconds: float) -> str:
     if hours:
         return f"{hours:d}:{minutes:02d}:{seconds:02d}"
     return f"{minutes:02d}:{seconds:02d}"
+
+
+def _execution_mode(runtimes: Iterable[str], *, shared_opencode: bool) -> str:
+    runtime_set = set(runtimes)
+    if "opencode" not in runtime_set:
+        return "runtime-native"
+    opencode_mode = "shared" if shared_opencode else "standalone"
+    if runtime_set != {"opencode"}:
+        return f"mixed ({opencode_mode} OpenCode + runtime-native)"
+    return opencode_mode
 
 
 def _slugify(value: str) -> str:
@@ -668,12 +682,19 @@ def _write_opencode_config(output_dir: Path, repo_root: Path) -> Path:
 def _opencode_environment(
     opencode_config_path: Path,
     temporary_dir: Path,
+    repo_root: Path,
+    server_password: str | None = None,
 ) -> dict[str, str]:
     env = os.environ.copy()
     env.setdefault("NO_COLOR", "1")
     env["OPENCODE_CONFIG"] = str(opencode_config_path)
     env["TMPDIR"] = str(temporary_dir)
     env["BUN_TMPDIR"] = str(temporary_dir)
+    env["PWD"] = str(repo_root)
+    env.pop("OPENCODE_PASSWORD", None)
+    env.pop("OPENCODE_SERVER_PASSWORD", None)
+    if server_password is not None:
+        env["OPENCODE_PASSWORD"] = server_password
     return env
 
 
@@ -825,9 +846,10 @@ async def _start_opencode_server(
         str(port),
         "--print-logs",
         "--log-level",
-        "INFO",
+        "info",
     ]
-    env = _opencode_environment(opencode_config_path, temporary_dir)
+    password = secrets.token_urlsafe(32)
+    env = _opencode_environment(opencode_config_path, temporary_dir, repo_root, password)
     with log_path.open("wb") as log_handle:
         log_handle.write(
             (
@@ -838,11 +860,15 @@ async def _start_opencode_server(
         process = await asyncio.create_subprocess_exec(
             *command,
             cwd=repo_root,
-            stdout=log_handle,
+            stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             env=env,
             start_new_session=True,
         )
+    if process.stdout is None:
+        await _terminate_process(process)
+        raise RuntimeError("opencode serve output pipe is unavailable")
+    log_task = asyncio.create_task(_write_server_log(process.stdout, log_path, password))
 
     try:
         deadline = asyncio.get_running_loop().time() + timeout_seconds
@@ -850,18 +876,60 @@ async def _start_opencode_server(
             if process.returncode is not None:
                 raise RuntimeError(f"opencode serve exited before becoming healthy; see {log_path}")
             if await asyncio.to_thread(_server_healthcheck, port):
-                return OpenCodeServer(process=process, url=url, log_path=log_path)
+                return OpenCodeServer(
+                    process=process,
+                    url=url,
+                    log_path=log_path,
+                    password=password,
+                    log_task=log_task,
+                )
             await asyncio.sleep(0.25)
     except BaseException:
         await _terminate_process(process)
+        await _finish_server_log(log_task)
         raise
 
     await _terminate_process(process)
+    await _finish_server_log(log_task)
     raise TimeoutError(f"opencode serve did not become healthy; see {log_path}")
+
+
+async def _write_server_log(reader: asyncio.StreamReader, log_path: Path, password: str) -> None:
+    secret = password.encode()
+    carry = b""
+    with log_path.open("ab") as log_handle:
+        while chunk := await reader.read(64 * 1024):
+            redacted = (carry + chunk).replace(secret, b"<redacted>")
+            keep = min(len(secret) - 1, len(redacted))
+            if keep:
+                log_handle.write(redacted[:-keep])
+                carry = redacted[-keep:]
+            else:
+                log_handle.write(redacted)
+                carry = b""
+        log_handle.write(carry.replace(secret, b"<redacted>"))
+
+
+async def _finish_server_log(log_task: asyncio.Task[None]) -> None:
+    done, _ = await asyncio.wait((log_task,), timeout=PROCESS_TERMINATION_GRACE_SECONDS)
+    if not done:
+        log_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await log_task
+        sys.stderr.write("Warning: timed out while draining the OpenCode server log.\n")
+        return
+    if log_task.cancelled():
+        sys.stderr.write("Warning: OpenCode server log collection was cancelled.\n")
+        return
+    try:
+        log_task.result()
+    except (OSError, RuntimeError, ValueError) as exc:
+        sys.stderr.write(f"Warning: could not finish the OpenCode server log: {exc}\n")
 
 
 async def _stop_opencode_server(server: OpenCodeServer) -> None:
     await _terminate_process(server.process)
+    await _finish_server_log(server.log_task)
 
 
 def _process_group_exists(process_group: int) -> bool:
@@ -891,21 +959,23 @@ async def _terminate_process(process: asyncio.subprocess.Process) -> None:
         await process.wait()
 
 
-def _opencode_review_command(request: ReviewRequest, *, attach_url: str | None) -> list[str]:
+def _opencode_review_command(request: ReviewRequest, *, server_url: str | None) -> list[str]:
     review_model = request.review_model
+    model = review_model.model
+    if review_model.reasoning:
+        model = f"{model}#{review_model.reasoning}"
     command = [
         request.runtime_bin,
         "run",
         "--model",
-        review_model.model,
+        model,
     ]
     command.extend(["--agent", "plan"])
     command.extend(["--format", "json"])
-    if review_model.reasoning:
-        command.extend(["--variant", review_model.reasoning])
-    if attach_url is not None:
-        command.extend(["--attach", attach_url])
-    command.extend(["--dir", str(request.repo_root)])
+    if server_url is None:
+        command.append("--standalone")
+    else:
+        command.extend(["--server", server_url])
     for file_path in request.context_files:
         command.extend(["-f", str(file_path)])
     command.extend(["--title", f"cross-ai-{review_model.slug}"])
@@ -964,9 +1034,9 @@ def _codex_review_command(request: ReviewRequest) -> list[str]:
     return command
 
 
-def _review_command(request: ReviewRequest, *, attach_url: str | None) -> list[str]:
+def _review_command(request: ReviewRequest, *, server_url: str | None) -> list[str]:
     if request.review_model.runtime == "opencode":
-        return _opencode_review_command(request, attach_url=attach_url)
+        return _opencode_review_command(request, server_url=server_url)
     if request.review_model.runtime == "claude":
         return _claude_review_command(request)
     if request.review_model.runtime == "codex":
@@ -1030,12 +1100,17 @@ def _validate_runtime_output(request: ReviewRequest, stdout: bytes) -> tuple[str
 
 
 async def _review_attempt(
-    request: ReviewRequest, *, attach_url: str | None, opencode_config_path: Path
+    request: ReviewRequest, *, server_url: str | None, opencode_config_path: Path
 ) -> ReviewAttempt:
-    command = _review_command(request, attach_url=attach_url)
+    command = _review_command(request, server_url=server_url)
 
     env = (
-        _opencode_environment(opencode_config_path, request.temporary_dir)
+        _opencode_environment(
+            opencode_config_path,
+            request.temporary_dir,
+            request.repo_root,
+            request.server_password if server_url is not None else None,
+        )
         if request.review_model.runtime == "opencode"
         else os.environ.copy()
     )
@@ -1058,6 +1133,8 @@ async def _review_attempt(
     except BaseException:
         await _terminate_process(process)
         raise
+    if request.server_password is not None and server_url is not None:
+        stdout = stdout.replace(request.server_password.encode(), b"<redacted>")
     returncode = _review_returncode(process.returncode, timed_out)
     final_text: str | None = None
     validation_error: str | None = None
@@ -1075,7 +1152,13 @@ async def _review_attempt(
         final_text=final_text,
         validation_error=validation_error,
         permission_denials=permission_denials,
-        mode="shared" if attach_url is not None else "direct",
+        mode=(
+            "runtime-native"
+            if request.review_model.runtime != "opencode"
+            else "shared"
+            if server_url is not None
+            else "standalone"
+        ),
     )
 
 
@@ -1083,17 +1166,17 @@ async def _collect_review_attempts(request: ReviewRequest, *, opencode_config_pa
     attempts = [
         await _review_attempt(
             request,
-            attach_url=request.attach_url,
+            server_url=request.server_url,
             opencode_config_path=opencode_config_path,
         )
     ]
     if (
         request.review_model.runtime == "opencode"
-        and request.attach_url is not None
+        and request.server_url is not None
         and attempts[0].returncode == 0
         and attempts[0].validation_error is not None
     ):
-        attempts.append(await _review_attempt(request, attach_url=None, opencode_config_path=opencode_config_path))
+        attempts.append(await _review_attempt(request, server_url=None, opencode_config_path=opencode_config_path))
     return attempts
 
 
@@ -1111,7 +1194,7 @@ def _review_result_header(
     retry_note = ""
     if len(attempts) > 1:
         retry_note = (
-            "A direct retry was performed because the attached shared-server "
+            "A standalone retry was performed because the shared-server "
             f"output failed validation: {attempts[0].validation_error}\n\n"
         )
     commands = "\n".join(f"- {item.mode}: {_render_command(item.command)}" for item in attempts)
@@ -1217,8 +1300,19 @@ def _write_run_summary(
         handle.write(f"- mode: `{summary.mode}`\n")
         handle.write(f"- output directory: `{summary.output_dir}`\n")
         handle.write(f"- total wall time: `{_format_duration(summary.elapsed_seconds)}`\n")
-        server_log = summary.server.log_path if summary.server else "not started (direct mode)"
-        handle.write(f"- execution mode: `{'shared' if summary.server else 'direct'}`\n")
+        has_opencode = any(result.model.runtime == "opencode" for result in summary.results)
+        execution = _execution_mode(
+            (result.model.runtime for result in summary.results),
+            shared_opencode=summary.server is not None,
+        )
+        server_log = (
+            summary.server.log_path
+            if summary.server
+            else "not started (standalone mode)"
+            if has_opencode
+            else "not applicable"
+        )
+        handle.write(f"- execution mode: `{execution}`\n")
         handle.write(f"- shared opencode server: `{server_log}`\n")
         handle.write(f"- generated OpenCode permission config: `{summary.opencode_config_path}`\n")
         handle.write("- context files:\n")
@@ -1245,10 +1339,13 @@ def _print_run_summary(
     elapsed_seconds: float,
 ) -> None:
     sys.stdout.write(f"Cross-AI output: {output_dir}\n")
+    execution = _execution_mode(
+        (result.model.runtime for result in results),
+        shared_opencode=server is not None,
+    )
+    sys.stdout.write(f"- execution mode: {execution}\n")
     if server is not None:
         sys.stdout.write(f"- shared opencode server log: {server.log_path}\n")
-    else:
-        sys.stdout.write("- execution mode: direct (no shared server)\n")
     for result in results:
         sys.stdout.write(
             f"- {result.model.slug}: exit={result.returncode} "
@@ -1294,9 +1391,13 @@ def _prepare_run(
 
 
 def _print_startup(run: PreparedRun) -> None:
+    execution = _execution_mode(
+        (model.runtime for model in run.models),
+        shared_opencode=run.shared_mode,
+    )
     sys.stdout.write("Cross-AI startup\n")
     sys.stdout.write(f"- repo root: {run.repo_root}\n")
-    sys.stdout.write(f"- mode: {run.mode}; execution: {'shared' if run.shared_mode else 'direct'}\n")
+    sys.stdout.write(f"- mode: {run.mode}; execution: {execution}\n")
     sys.stdout.write(f"- output directory: {run.output_dir}\n")
     sys.stdout.write(f"- temporary directory: {run.temporary_dir}; limit={OPENCODE_TEMP_LIMIT_BYTES} bytes\n")
     for model in run.models:
@@ -1373,7 +1474,8 @@ def _review_tasks(run: PreparedRun, server: OpenCodeServer | None) -> list[Corou
                 output_dir=run.output_dir,
                 temporary_dir=run.temporary_dir,
                 timeout_seconds=review_model.timeout_seconds,
-                attach_url=(server.url if server and review_model.runtime == "opencode" else None),
+                server_url=(server.url if server and review_model.runtime == "opencode" else None),
+                server_password=(server.password if server and review_model.runtime == "opencode" else None),
                 min_output_chars=DEFAULT_MIN_OUTPUT_CHARS,
                 require_review_markers=run.mode == "review",
             ),
@@ -1535,7 +1637,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--repo-root",
-        help="Exact existing project directory used for both OpenCode cwd and --dir.",
+        help="Exact existing project directory used as the reviewer working directory.",
     )
     parser.add_argument(
         "--mode",
@@ -1582,7 +1684,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-shared-server",
         action="store_true",
-        help="Run each reviewer directly without a shared OpenCode server (debug mode).",
+        help="Run each OpenCode reviewer with its own standalone server (debug mode).",
     )
     return parser
 
