@@ -30,7 +30,7 @@ builds, general shell commands, web access, and nested delegation are disabled.
 ## Requirements
 
 - Python 3.12 or newer
-- [OpenCode](https://opencode.ai/) for the standard reviewers
+- [OpenCode](https://opencode.ai/) v2 for the standard reviewers
 - Claude Code and Codex only when selected reviewers use those runtimes
 
 Provider authentication and model access are managed by the corresponding AI
@@ -140,6 +140,10 @@ load the active configuration or display its reviewer catalog.
 
 Reports are written under `.adversarial-reviews/` inside the selected workspace
 unless `--output-dir` specifies another directory within that workspace.
+OpenCode reviewers share one dedicated server created for the Cross-AI run;
+`--no-shared-server` instead gives each OpenCode reviewer a private standalone
+server for debugging. Cross-AI does not use OpenCode's user-wide background
+service in either mode.
 
 ## Agent usage protocol
 

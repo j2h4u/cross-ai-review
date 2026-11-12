@@ -420,22 +420,27 @@ def test_runtime_command_flags_remain_stable(tmp_path: Path) -> None:
         output_dir=tmp_path,
         temporary_dir=tmp_path,
         timeout_seconds=1,
-        attach_url="http://127.0.0.1:1234",
+        server_url="http://127.0.0.1:1234",
+        server_password="test-password",
         min_output_chars=5,
         require_review_markers=True,
     )
-    opencode = cross_ai._review_command(request, attach_url=request.attach_url)
+    opencode = cross_ai._review_command(request, server_url=request.server_url)
     assert opencode[:2] == ["/bin/opencode", "run"]
-    assert opencode[opencode.index("--model") + 1] == "provider/model"
+    assert opencode[opencode.index("--model") + 1] == "provider/model#max"
     assert opencode[opencode.index("--agent") + 1] == "plan"
     assert opencode[opencode.index("--format") + 1] == "json"
-    assert opencode[opencode.index("--variant") + 1] == "max"
-    assert opencode[opencode.index("--attach") + 1] == request.attach_url
-    assert opencode[opencode.index("--dir") + 1] == str(tmp_path)
+    assert opencode[opencode.index("--server") + 1] == request.server_url
+    assert "--variant" not in opencode
+    assert "--attach" not in opencode
+    assert "--dir" not in opencode
     assert opencode[opencode.index("--title") + 1] == "cross-ai-oc"
     for context_file in request.context_files:
         assert str(context_file) in opencode
     assert opencode[-2:] == ["--", "review prompt"]
+    standalone = cross_ai._review_command(request, server_url=None)
+    assert "--standalone" in standalone
+    assert "--server" not in standalone
 
     for runtime, model, expected in (
         ("claude", "opus", ("--permission-mode", "plan", "--output-format", "json", "--effort", "low")),
@@ -447,10 +452,11 @@ def test_runtime_command_flags_remain_stable(tmp_path: Path) -> None:
                     **request.__dict__,
                     "runtime_bin": f"/bin/{runtime}",
                     "review_model": cross_ai.ReviewerSpec(runtime, runtime, model, 1, "low"),
-                    "attach_url": None,
+                    "server_url": None,
+                    "server_password": None,
                 }
             ),
-            attach_url=None,
+            server_url=None,
         )
         for flag in expected:
             assert flag in command

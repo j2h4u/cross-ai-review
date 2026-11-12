@@ -16,7 +16,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPOSITORY_ROOT / "cross_ai.py"
 
 
-def write_fake_opencode(path: Path, *, hang: bool) -> None:
+def write_fake_opencode(path: Path, *, hang: bool, healthy_server: bool = False) -> None:
     behavior = (
         "runtime_pid = os.environ.get('CROSS_AI_TEST_RUNTIME_PID')\n"
         "if runtime_pid:\n"
@@ -35,11 +35,27 @@ def write_fake_opencode(path: Path, *, hang: bool) -> None:
         "import json\n"
         "import os\n"
         "import subprocess\n"
+        "import sys\n"
         "import time\n"
+        "from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer\n"
         "from pathlib import Path\n"
+        f"HEALTHY_SERVER = {healthy_server!r}\n"
         "assert os.environ['TMPDIR'] == os.environ['BUN_TMPDIR']\n"
         "Path(os.environ['TMPDIR'], 'libopentui.so').write_bytes(b'x' * 4096)\n"
+        "if 'serve' in sys.argv:\n"
+        "    print('server password ' + os.environ['OPENCODE_PASSWORD'], flush=True)\n"
+        "    if HEALTHY_SERVER:\n"
+        "        class Handler(BaseHTTPRequestHandler):\n"
+        "            def do_GET(self):\n"
+        "                self.send_response(200 if self.path == '/global/health' else 404)\n"
+        "                self.end_headers()\n"
+        "            def log_message(self, format, *args):\n"
+        "                pass\n"
+        "        port = int(sys.argv[sys.argv.index('--port') + 1])\n"
+        "        ThreadingHTTPServer(('127.0.0.1', port), Handler).serve_forever()\n"
         f"{behavior}\n"
+        "if '--server' in sys.argv:\n"
+        "    assert os.environ.get('OPENCODE_PASSWORD')\n"
         "message = 'Finding: lifecycle test output ' + ('x' * 240)\n"
         "print(json.dumps({'type': 'text', 'part': {'messageID': 'm1', 'text': message}}))\n"
         "print(json.dumps({'type': 'step_finish', 'part': {'messageID': 'm1', 'reason': 'stop'}}))\n",
@@ -135,14 +151,22 @@ def run_direct(root: Path, xdg: Path, context: Path) -> subprocess.CompletedProc
     )
 
 
-def test_temp_environment_limit_and_cleanup() -> None:
+def test_temp_environment_limit_and_cleanup(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OPENCODE_PASSWORD", "inherited-password")
+    monkeypatch.setenv("OPENCODE_SERVER_PASSWORD", "inherited-legacy-password")
     path = cross_ai._create_temporary_directory()
     try:
         assert path.parent == Path("/tmp")
         assert stat.S_IMODE(path.stat().st_mode) == 0o700
-        env = cross_ai._opencode_environment(Path("/tmp/config"), path)
+        env = cross_ai._opencode_environment(Path("/tmp/config"), path, Path("/tmp/project"), "test-password")
         assert env["TMPDIR"] == str(path)
         assert env["BUN_TMPDIR"] == str(path)
+        assert env["PWD"] == "/tmp/project"
+        assert env["OPENCODE_PASSWORD"] == "test-password"
+        assert "OPENCODE_SERVER_PASSWORD" not in env
+        standalone = cross_ai._opencode_environment(Path("/tmp/config"), path, Path("/tmp/project"))
+        assert "OPENCODE_PASSWORD" not in standalone
+        assert "OPENCODE_SERVER_PASSWORD" not in standalone
         (path / "oversized.so").write_bytes(b"xx")
         with pytest.raises(cross_ai.TemporaryDirectoryLimitExceeded):
             asyncio.run(cross_ai._monitor_temporary_directory(path, limit_bytes=1))
@@ -176,6 +200,23 @@ def test_temp_monitor_removes_only_stale_bun_artifacts() -> None:
         cross_ai._remove_temporary_directory(path)
 
 
+def test_server_log_redacts_secret_across_large_chunks(tmp_path: Path) -> None:
+    secret = "known-secret"
+    log_path = tmp_path / "server.log"
+
+    async def write_log() -> None:
+        reader = asyncio.StreamReader()
+        reader.feed_data(b"x" * (64 * 1024 - 5) + secret[:5].encode())
+        reader.feed_data(secret[5:].encode() + b"\n")
+        reader.feed_eof()
+        await cross_ai._write_server_log(reader, log_path, secret)
+
+    asyncio.run(write_log())
+    log = log_path.read_bytes()
+    assert secret.encode() not in log
+    assert b"<redacted>" in log
+
+
 def test_success_preserves_report_and_removes_run_temp(tmp_path: Path) -> None:
     before = set(Path("/tmp").glob(f"cross-ai-{os.getuid()}-*"))
     fake = tmp_path / "opencode"
@@ -189,6 +230,42 @@ def test_success_preserves_report_and_removes_run_temp(tmp_path: Path) -> None:
     reports = list((tmp_path / "reports").glob("*/oc-review.md"))
     assert len(reports) == 1
     assert "Finding: lifecycle test output" in reports[0].read_text(encoding="utf-8")
+    assert set(Path("/tmp").glob(f"cross-ai-{os.getuid()}-*")) == before
+
+
+def test_shared_success_stops_server_redacts_log_and_removes_run_temp(tmp_path: Path) -> None:
+    before = set(Path("/tmp").glob(f"cross-ai-{os.getuid()}-*"))
+    fake = tmp_path / "opencode"
+    context = tmp_path / "context.md"
+    context.write_text("review me", encoding="utf-8")
+    write_fake_opencode(fake, hang=False, healthy_server=True)
+    xdg = tmp_path / "xdg"
+    config_for(fake, xdg)
+
+    result = subprocess.run(
+        [
+            str(SCRIPT),
+            "--reviewer",
+            "oc-review",
+            "--repo-root",
+            str(tmp_path),
+            "--output-dir",
+            "reports",
+            str(context),
+        ],
+        cwd=tmp_path,
+        env={**os.environ, "XDG_CONFIG_HOME": str(xdg)},
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=15,
+    )
+
+    assert result.returncode == 0, result.stderr
+    run_dir = next((tmp_path / "reports").iterdir())
+    assert "Finding: lifecycle test output" in (run_dir / "oc-review.md").read_text(encoding="utf-8")
+    assert "execution mode: `shared`" in (run_dir / "summary.md").read_text(encoding="utf-8")
+    assert "server password <redacted>" in (run_dir / "opencode-serve.log").read_text(encoding="utf-8")
     assert set(Path("/tmp").glob(f"cross-ai-{os.getuid()}-*")) == before
 
 
@@ -277,6 +354,8 @@ def test_partial_server_startup_kills_process_group(tmp_path: Path) -> None:
                     timeout_seconds=1,
                 )
             )
+        assert "--log-level info" in (tmp_path / "opencode-serve.log").read_text(encoding="utf-8")
+        assert "server password <redacted>" in (tmp_path / "opencode-serve.log").read_text(encoding="utf-8")
         child_pid = read_pid(child_path)
         runtime_pid = read_pid(runtime_path)
         assert child_pid is not None and runtime_pid is not None
