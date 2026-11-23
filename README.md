@@ -215,8 +215,8 @@ Mutation testing is outside the QA scope for this small CLI because its
 maintenance cost has no clear payoff. The initial clone audit using the Python
 template's pyscn and jscpd policies found six production pairs across runtime
 adapters, configuration validation, and report formatting. Those pairs serve
-distinct contracts. It also found two overlaps in lifecycle test setup and
-invocation. Revisit a suppression budget if lint or typing exceptions start
+distinct contracts. Sharing lifecycle test setup and invocation removed the
+other two pairs. Revisit a suppression budget if lint or typing exceptions start
 accumulating.
 
 This public repository currently has no open-source license. Public visibility

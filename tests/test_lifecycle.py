@@ -129,13 +129,20 @@ def drain(process: subprocess.Popen[str]) -> None:
         process.communicate(timeout=5)
 
 
-def run_direct(root: Path, xdg: Path, context: Path) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+def run_successful_review(root: Path, *, shared: bool) -> Path:
+    before = set(Path("/tmp").glob(f"cross-ai-{os.getuid()}-*"))
+    fake = root / "opencode"
+    context = root / "context.md"
+    context.write_text("review me", encoding="utf-8")
+    write_fake_opencode(fake, hang=False, healthy_server=shared)
+    xdg = root / "xdg"
+    config_for(fake, xdg, include_unavailable_runtimes=not shared)
+    result = subprocess.run(
         [
             str(SCRIPT),
             "--reviewer",
             "oc-review",
-            "--no-shared-server",
+            *([] if shared else ["--no-shared-server"]),
             "--repo-root",
             str(root),
             "--output-dir",
@@ -149,6 +156,11 @@ def run_direct(root: Path, xdg: Path, context: Path) -> subprocess.CompletedProc
         check=False,
         timeout=15,
     )
+    assert result.returncode == 0, result.stderr
+    (report,) = (root / "reports").glob("*/oc-review.md")
+    assert "Finding: lifecycle test output" in report.read_text(encoding="utf-8")
+    assert set(Path("/tmp").glob(f"cross-ai-{os.getuid()}-*")) == before
+    return report.parent
 
 
 def test_temp_environment_limit_and_cleanup(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -218,55 +230,14 @@ def test_server_log_redacts_secret_across_large_chunks(tmp_path: Path) -> None:
 
 
 def test_success_preserves_report_and_removes_run_temp(tmp_path: Path) -> None:
-    before = set(Path("/tmp").glob(f"cross-ai-{os.getuid()}-*"))
-    fake = tmp_path / "opencode"
-    context = tmp_path / "context.md"
-    context.write_text("review me", encoding="utf-8")
-    write_fake_opencode(fake, hang=False)
-    xdg = tmp_path / "xdg"
-    config_for(fake, xdg, include_unavailable_runtimes=True)
-    result = run_direct(tmp_path, xdg, context)
-    assert result.returncode == 0, result.stderr
-    reports = list((tmp_path / "reports").glob("*/oc-review.md"))
-    assert len(reports) == 1
-    assert "Finding: lifecycle test output" in reports[0].read_text(encoding="utf-8")
-    assert set(Path("/tmp").glob(f"cross-ai-{os.getuid()}-*")) == before
+    run_dir = run_successful_review(tmp_path, shared=False)
+    assert "execution mode: `standalone`" in (run_dir / "summary.md").read_text(encoding="utf-8")
 
 
 def test_shared_success_stops_server_redacts_log_and_removes_run_temp(tmp_path: Path) -> None:
-    before = set(Path("/tmp").glob(f"cross-ai-{os.getuid()}-*"))
-    fake = tmp_path / "opencode"
-    context = tmp_path / "context.md"
-    context.write_text("review me", encoding="utf-8")
-    write_fake_opencode(fake, hang=False, healthy_server=True)
-    xdg = tmp_path / "xdg"
-    config_for(fake, xdg)
-
-    result = subprocess.run(
-        [
-            str(SCRIPT),
-            "--reviewer",
-            "oc-review",
-            "--repo-root",
-            str(tmp_path),
-            "--output-dir",
-            "reports",
-            str(context),
-        ],
-        cwd=tmp_path,
-        env={**os.environ, "XDG_CONFIG_HOME": str(xdg)},
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=15,
-    )
-
-    assert result.returncode == 0, result.stderr
-    run_dir = next((tmp_path / "reports").iterdir())
-    assert "Finding: lifecycle test output" in (run_dir / "oc-review.md").read_text(encoding="utf-8")
+    run_dir = run_successful_review(tmp_path, shared=True)
     assert "execution mode: `shared`" in (run_dir / "summary.md").read_text(encoding="utf-8")
     assert "server password <redacted>" in (run_dir / "opencode-serve.log").read_text(encoding="utf-8")
-    assert set(Path("/tmp").glob(f"cross-ai-{os.getuid()}-*")) == before
 
 
 @pytest.mark.parametrize(
