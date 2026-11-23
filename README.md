@@ -190,9 +190,16 @@ cleanup, successful report preservation, signal-driven process-group teardown,
 and partial shared-server startup.
 
 Run `just check` for formatting, lint, type, dead-code, lock, compile, and
-packaging checks. Run `just crap-check` for the per-function CRAP threshold of
-30, or `just verify` for the complete local quality contract. `just coverage`
-is a diagnostic report and does not enforce a standalone coverage target.
+packaging checks. Run `just crap-check` to enforce independent per-function
+limits of 10 for Radon cyclomatic complexity and 30 for CRAP. It runs the full
+test suite, so `just verify` runs those tests once.
+`just coverage` is a diagnostic report and does not enforce a standalone
+coverage target.
+
+The CLI uses local quality gates and GitHub CodeQL. It ships one Python module
+and has no container deployment. The template's Tach and import-linter contracts
+between production modules, and its container checks, apply when those
+boundaries or a deployment exist.
 
 This public repository currently has no open-source license. Public visibility
 does not grant permission to copy, modify, or redistribute the code.

@@ -1,4 +1,4 @@
-"""Enforce a per-function CRAP score limit from coverage.py JSON and Radon."""
+"""Enforce per-function Radon complexity and CRAP limits."""
 
 import argparse
 import json
@@ -10,6 +10,7 @@ from typing import Protocol, TypedDict, TypeGuard, cast
 from radon.complexity import cc_visit
 
 DEFAULT_THRESHOLD = 30.0
+DEFAULT_MAX_COMPLEXITY = 10
 DEFAULT_SOURCE = Path("cross_ai.py")
 
 
@@ -49,6 +50,7 @@ class _GateArgs(Protocol):
     coverage: Path
     src: Path
     threshold: float
+    max_complexity: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,37 +105,47 @@ def _metrics(report: _CoverageReport, source: Path) -> list[FunctionMetric]:
     for qualname, block in [
         item for root in _CC_VISIT(source.read_text(encoding="utf-8")) for item in _qualified_blocks(root)
     ]:
-        if qualname not in functions:
-            continue
-        summary = functions[qualname]["summary"]
-        statements = summary["num_statements"]
-        coverage = 1.0 if statements <= 0 else summary["covered_lines"] / statements
+        coverage = 0.0
+        if qualname in functions:
+            summary = functions[qualname]["summary"]
+            statements = summary["num_statements"]
+            coverage = 1.0 if statements <= 0 else summary["covered_lines"] / statements
         score = block.complexity**2 * (1 - coverage) ** 3 + block.complexity
         metrics.append(FunctionMetric(qualname, block.lineno, block.complexity, coverage, score))
     return metrics
 
 
 def _parse_args(argv: list[str] | None) -> _GateArgs:
-    parser = argparse.ArgumentParser(description="Fail when a function exceeds the CRAP threshold.")
+    parser = argparse.ArgumentParser(description="Fail when a function exceeds the Radon CC or CRAP threshold.")
     parser.add_argument("--coverage", type=Path, required=True)
     parser.add_argument("--src", type=Path, default=DEFAULT_SOURCE)
     parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD)
+    parser.add_argument("--max-complexity", type=int, default=DEFAULT_MAX_COMPLEXITY)
     return cast(_GateArgs, parser.parse_args(argv))
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     metrics = _metrics(_load_report(args.coverage), args.src)
-    offenders = sorted((metric for metric in metrics if metric.crap > args.threshold), key=lambda item: -item.crap)
+    offenders = sorted(
+        (metric for metric in metrics if metric.crap > args.threshold or metric.complexity > args.max_complexity),
+        key=lambda item: -item.crap,
+    )
     if offenders:
-        print(f"CRAP gate failed: {len(offenders)} function(s) exceed {args.threshold:.2f}")
+        print(
+            f"Radon CC/CRAP gate failed: {len(offenders)} function(s) exceed "
+            f"CC {args.max_complexity} or CRAP {args.threshold:.2f}"
+        )
         for metric in offenders[:20]:
             print(
                 f"  {args.src}::{metric.key}:{metric.start_line} CRAP {metric.crap:.2f}, "
                 f"complexity {metric.complexity}, coverage {metric.coverage_fraction:.1%}"
             )
         return 1
-    print(f"CRAP gate passed: {len(metrics)} function(s), threshold {args.threshold:.2f}")
+    print(
+        f"Radon CC/CRAP gate passed: {len(metrics)} function(s), "
+        f"CC <= {args.max_complexity}, CRAP <= {args.threshold:.2f}"
+    )
     return 0
 
 

@@ -1,6 +1,8 @@
 import argparse
 import asyncio
 import json
+import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
 from unittest import mock
@@ -8,6 +10,20 @@ from unittest import mock
 import pytest
 
 import cross_ai
+
+
+def test_radon_gate_rejects_fully_covered_complex_function(tmp_path: Path) -> None:
+    source = tmp_path / "sample.py"
+    source.write_text("def choose(flag):\n    if flag:\n        return 1\n    return 0\n", encoding="utf-8")
+    coverage = tmp_path / "coverage.json"
+    summary = {"num_statements": 3, "covered_lines": 3}
+    report = {"files": {str(source): {"functions": {"choose": {"summary": summary}}}}}
+    coverage.write_text(json.dumps(report), encoding="utf-8")
+    args = [sys.executable, "-m", "scripts.crap_gate", "--coverage", str(coverage), "--src", str(source)]
+    failed = subprocess.run([*args, "--max-complexity", "1"], capture_output=True, text=True, check=False)
+    assert failed.returncode == 1
+    assert "CRAP 2.00, complexity 2, coverage 100.0%" in failed.stdout
+    subprocess.run([*args, "--max-complexity", "2"], capture_output=True, check=True)
 
 
 def request(root: Path, runtime: str = "codex") -> cross_ai.ReviewRequest:

@@ -48,12 +48,14 @@ coverage:
 crap:
     uv run pytest --cov=cross_ai --cov-report=term-missing --crap --crap-threshold=30 --crap-top-n=30
 
-# Fail if any function exceeds CRAP 30.
+# Independently enforce Radon CC <= 10 and CRAP <= 30.
 crap-check:
-    coverage_file="$(mktemp /tmp/cross-ai-crap-coverage.XXXXXX.json)"; \
-    trap 'rm -f "$coverage_file"' EXIT; \
-    uv run pytest --cov=cross_ai --cov-report=json:"$coverage_file"; \
-    uv run python -m scripts.crap_gate --coverage "$coverage_file" --src cross_ai.py --threshold 30
+    #!/usr/bin/env bash
+    set -euo pipefail
+    coverage_file="$(mktemp /tmp/cross-ai-crap-coverage.XXXXXX.json)"
+    trap 'rm -f "$coverage_file"' EXIT
+    uv run pytest --cov=cross_ai --cov-report=json:"$coverage_file"
+    uv run python -m scripts.crap_gate --coverage "$coverage_file" --src cross_ai.py --threshold 30 --max-complexity 10
 
 # Audit the locked dependency set for known vulnerabilities.
 deps-audit:
@@ -65,4 +67,4 @@ deps-audit:
     uv run pip-audit -r "$requirements" --strict --no-deps --disable-pip
 
 # Full local quality contract.
-verify: check crap-check unit deps-audit
+verify: check crap-check deps-audit

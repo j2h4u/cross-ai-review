@@ -797,18 +797,25 @@ def _extract_final_review_text(stdout: bytes) -> str:
     return final_text
 
 
-def _missing_finish_candidate(stdout: bytes) -> tuple[str, str, str] | None:
-    events = _decode_review_output(stdout)
-    if not events or events[-1].get("type") != "text":
+def _text_event_ids(event: dict[str, object]) -> tuple[str, str] | None:
+    if event.get("type") != "text":
         return None
-    last = events[-1]
-    part = last.get("part")
-    session_id = last.get("sessionID")
+    part = event.get("part")
+    session_id = event.get("sessionID")
     message_id = part.get("messageID") if isinstance(part, dict) else None
     if not isinstance(session_id, str) or not isinstance(message_id, str):
         return None
     if any(not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", value) for value in (session_id, message_id)):
         return None
+    return session_id, message_id
+
+
+def _missing_finish_candidate(stdout: bytes) -> tuple[str, str, str] | None:
+    events = _decode_review_output(stdout)
+    ids = _text_event_ids(events[-1]) if events else None
+    if ids is None:
+        return None
+    session_id, message_id = ids
     if any(event.get("sessionID") != session_id or event.get("type") == "error" for event in events):
         return None
     texts, finishes = _collect_review_parts(events)
@@ -830,14 +837,20 @@ def _confirmed_message_text(payload: object, message_id: str, expected: str) -> 
     ):
         return None
     timing, content = message.get("time"), message.get("content")
-    if not isinstance(timing, dict) or type(timing.get("completed")) is not int or not isinstance(content, list):
+    if not isinstance(timing, dict) or type(timing.get("completed")) is not int:
         return None
-    text = "\n".join(
+    text = _opencode_content_text(content)
+    return text if text == expected else None
+
+
+def _opencode_content_text(content: object) -> str | None:
+    if not isinstance(content, list):
+        return None
+    return "\n".join(
         part["text"]
         for part in content
         if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str)
     ).strip()
-    return text if text == expected else None
 
 
 def _validate_final_review_text(final_text: str, *, min_output_chars: int, require_review_markers: bool) -> str:
@@ -1098,6 +1111,16 @@ def _extract_claude_review_text(stdout: bytes) -> str:
     return result.strip()
 
 
+def _codex_event_text(event: object) -> str | None:
+    if not isinstance(event, dict) or event.get("type") != "item.completed":
+        return None
+    item = event.get("item")
+    if not isinstance(item, dict) or item.get("type") != "agent_message":
+        return None
+    text = item.get("text")
+    return text.strip() if isinstance(text, str) else None
+
+
 def _extract_codex_review_text(stdout: bytes) -> str:
     try:
         raw_text = stdout.decode("utf-8")
@@ -1110,14 +1133,8 @@ def _extract_codex_review_text(stdout: bytes) -> str:
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if not isinstance(event, dict) or event.get("type") != "item.completed":
-            continue
-        item = event.get("item")
-        if not isinstance(item, dict) or item.get("type") != "agent_message":
-            continue
-        text = item.get("text")
-        if isinstance(text, str) and text.strip():
-            messages.append(text.strip())
+        if text := _codex_event_text(event):
+            messages.append(text)
     if not messages:
         raise ValueError("Codex output has no completed agent message")
     return messages[-1]
@@ -1191,6 +1208,17 @@ async def _recover_shared_review(
     return None
 
 
+async def _validate_review_attempt_output(
+    request: ReviewRequest, server_url: str | None, stdout: bytes, raw_stdout: bytes, env: dict[str, str]
+) -> tuple[str | None, str | None]:
+    text, error = _validate_runtime_output(request, stdout)
+    if error is not None and server_url is not None and request.review_model.runtime == "opencode":
+        confirmed = await _recover_shared_review(request, server_url, raw_stdout, env)
+        if confirmed is not None:
+            return confirmed, None
+    return text, error
+
+
 async def _review_attempt(
     request: ReviewRequest, *, server_url: str | None, opencode_config_path: Path
 ) -> ReviewAttempt:
@@ -1236,11 +1264,9 @@ async def _review_attempt(
         with contextlib.suppress(ValueError):
             permission_denials = _permission_denials(_decode_review_output(stdout))
     if returncode == 0:
-        final_text, validation_error = _validate_runtime_output(request, stdout)
-        if validation_error is not None and server_url is not None and request.review_model.runtime == "opencode":
-            final_text = await _recover_shared_review(request, server_url, raw_stdout, env)
-            if final_text is not None:
-                validation_error = None
+        final_text, validation_error = await _validate_review_attempt_output(
+            request, server_url, stdout, raw_stdout, env
+        )
     return ReviewAttempt(
         command=command,
         stdout=stdout,
@@ -1249,13 +1275,7 @@ async def _review_attempt(
         final_text=final_text,
         validation_error=validation_error,
         permission_denials=permission_denials,
-        mode=(
-            "runtime-native"
-            if request.review_model.runtime != "opencode"
-            else "shared"
-            if server_url is not None
-            else "standalone"
-        ),
+        mode=_execution_mode((request.review_model.runtime,), shared_opencode=server_url is not None),
     )
 
 
@@ -1834,17 +1854,19 @@ def _dispatch(argv: list[str]) -> int:
     parser = _build_parser()
     args = _parse_args(argv, parser)
     if args.init_config:
-        if (
-            args.context_file
-            or args.repo_root
-            or args.goal
-            or args.mode != "review"
-            or args.output_dir != DEFAULT_OUTPUT_DIR
-            or args.reviewer
-            or args.premium
-            or args.all
-            or args.profile
-            or args.no_shared_server
+        if any(
+            (
+                args.context_file,
+                args.repo_root,
+                args.goal,
+                args.mode != "review",
+                args.output_dir != DEFAULT_OUTPUT_DIR,
+                args.reviewer,
+                args.premium,
+                args.all,
+                args.profile,
+                args.no_shared_server,
+            )
         ):
             parser.error("--init-config cannot be combined with review or planning arguments")
         destination = _init_config()
