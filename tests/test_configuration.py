@@ -121,13 +121,13 @@ def test_init_maps_exclusive_create_race_to_non_overwrite_error(
     destination = config_home / "cross-ai/config.toml"
     destination.parent.mkdir(parents=True)
     original_open = Path.open
-    original_write_text = Path.write_text
 
-    def race_open(path: Path, mode: str = "r", *args: object, **kwargs: object):
+    def race_open(path: Path, mode: str, *, encoding: str):
         if path == destination and mode == "x":
-            original_write_text(path, "racing writer\n", **kwargs)
+            with original_open(path, "w", encoding=encoding) as handle:
+                handle.write("racing writer\n")
             raise FileExistsError(path)
-        return original_open(path, mode, *args, **kwargs)
+        return original_open(path, mode, encoding=encoding)
 
     with (
         mock.patch.object(Path, "open", autospec=True, side_effect=race_open),
@@ -472,9 +472,6 @@ def test_runtime_command_flags_remain_stable(tmp_path: Path) -> None:
 
 
 def test_installed_python312_cli_initializes_from_foreign_cwd(tmp_path: Path) -> None:
-    python312 = Path("/home/j2h4u/.local/bin/python3.12")
-    if not python312.is_file():
-        pytest.skip("Python 3.12 is unavailable")
     dist = tmp_path / "dist"
     dist.mkdir()
     build = subprocess.run(
@@ -489,7 +486,7 @@ def test_installed_python312_cli_initializes_from_foreign_cwd(tmp_path: Path) ->
     with zipfile.ZipFile(wheel) as archive:
         assert any(name.endswith("share/cross-ai-review/cross-ai.config.toml") for name in archive.namelist())
     venv = tmp_path / "venv"
-    subprocess.run([str(python312), "-m", "venv", str(venv)], check=True, capture_output=True)
+    subprocess.run(["uv", "venv", "--python", "3.12", str(venv)], check=True, capture_output=True)
     installed_python = venv / "bin/python"
     install = subprocess.run(
         ["uv", "pip", "install", "--python", str(installed_python), "--no-deps", str(wheel)],

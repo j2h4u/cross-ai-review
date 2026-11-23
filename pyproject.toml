@@ -87,6 +87,7 @@ skip_covered = true
 
 [dependency-groups]
 dev = [
+  "actionlint-py>=1.7.12.24",
   "basedpyright>=1.39.10",
   "pip-audit>=2.10.1",
   "pytest>=9.1.1",

@@ -189,17 +189,32 @@ The suite covers the permission contract, temporary-directory limit and
 cleanup, successful report preservation, signal-driven process-group teardown,
 and partial shared-server startup.
 
-Run `just check` for formatting, lint, type, dead-code, lock, compile, and
-packaging checks. Run `just crap-check` to enforce independent per-function
-limits of 10 for Radon cyclomatic complexity and 30 for CRAP. It runs the full
-test suite, so `just verify` runs those tests once.
+Run `just check` for formatting, lint, production and test typing, workflow
+lint, dead-code, lock, compile, and packaging checks. Run `just crap-check` to
+enforce independent per-function limits of 10 for Radon cyclomatic complexity
+and 30 for CRAP. It runs the full test suite, so `just verify` runs those tests
+once.
 `just coverage` is a diagnostic report and does not enforce a standalone
 coverage target.
+
+The test suite uses uv to provision Python 3.12, installs the wheel in an
+isolated environment, and verifies that the installed CLI can create and load
+its bundled configuration from outside the checkout.
 
 The CLI uses local quality gates and GitHub CodeQL. It ships one Python module
 and has no container deployment. The template's Tach and import-linter contracts
 between production modules, and its container checks, apply when those
 boundaries or a deployment exist.
+
+The CLI currently uses only Python's standard library at runtime. Revisit
+deptry when third-party runtime dependencies are introduced. The CodeQL
+workflow uses full version tags. A separate pin-policy checker would protect
+future workflow edits.
+
+Evaluate mutation testing with a focused run on review-result and
+process-cleanup tests before adding a recurring gate. Review a clone baseline
+before enforcing it. Revisit a suppression budget if lint or typing exceptions
+start accumulating.
 
 This public repository currently has no open-source license. Public visibility
 does not grant permission to copy, modify, or redistribute the code.

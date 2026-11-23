@@ -225,7 +225,7 @@ def test_opencode_output_is_strict_and_codex_tolerates_unrelated_lines() -> None
 
 
 def test_bash_permission_failure_accepts_only_permission_errors() -> None:
-    events = (
+    events: tuple[dict[str, object], ...] = (
         {},
         {"part": "not-a-table"},
         {"part": {"type": "text", "tool": "bash"}},
@@ -335,8 +335,8 @@ model = "provider/model"
 
 def test_permission_policy_and_summary_preserve_contract(tmp_path: Path) -> None:
     permissions = cross_ai._opencode_permissions(tmp_path)
-    assert permissions["read"]["*"] == "allow"
-    assert permissions["bash"]["*"] == "deny"
+    assert isinstance(read := permissions["read"], dict) and read["*"] == "allow"
+    assert isinstance(bash := permissions["bash"], dict) and bash["*"] == "deny"
     for tool in ("edit", "write", "task", "question", "webfetch", "websearch", "skill"):
         assert permissions[tool] == "deny"
     denial = cross_ai.PermissionDenial("make", "denied", "rule")
@@ -378,7 +378,7 @@ def test_review_attempt_success_timeout_and_exception(tmp_path: Path) -> None:
     class Process:
         returncode = 0
 
-        def __init__(self, *outputs: object) -> None:
+        def __init__(self, *outputs: bytes | BaseException) -> None:
             self.outputs = list(outputs)
 
         async def communicate(self) -> tuple[bytes, None]:

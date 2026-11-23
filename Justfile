@@ -25,6 +25,14 @@ fmt-check:
 typecheck:
     uv run basedpyright cross_ai.py scripts
 
+# Type-check pytest fixtures and assertions.
+typecheck-tests:
+    uv run basedpyright tests --warnings
+
+# Validate GitHub Actions workflow syntax and expressions.
+actionlint:
+    uv run actionlint
+
 # Scan for dead code.
 dead-code:
     uv run vulture
@@ -34,7 +42,7 @@ package-check:
     uv build
 
 # Run the static quality gate.
-check: fmt-check lint lock-check typecheck compile dead-code package-check
+check: fmt-check lint lock-check typecheck typecheck-tests actionlint compile dead-code package-check
 
 # Run focused tests.
 unit:

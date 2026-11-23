@@ -298,11 +298,16 @@ def test_signals_clean_temp_and_process_group(tmp_path: Path, signum: signal.Sig
         },
     )
     try:
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + 30
         while (
-            not marker.exists() or not child_path.exists() or not runtime_path.exists()
-        ) and time.monotonic() < deadline:
+            (not marker.exists() or not child_path.exists() or not runtime_path.exists())
+            and process.poll() is None
+            and time.monotonic() < deadline
+        ):
             time.sleep(0.05)
+        if process.poll() is not None:
+            _, stderr = process.communicate()
+            pytest.fail(f"Cross-AI exited before the fake runtime signalled readiness: {stderr}")
         assert marker.exists(), "fake runtime did not start"
         assert child_path.exists()
         assert runtime_path.exists()
@@ -332,8 +337,18 @@ def test_partial_server_startup_kills_process_group(tmp_path: Path) -> None:
     runtime_path = tmp_path / "runtime-pid"
     temporary = cross_ai._create_temporary_directory()
     write_fake_opencode(fake, hang=True)
+
+    def wait_for_unhealthy_runtime(_port: int) -> bool:
+        # Exercise cleanup after the fake has started its child, independent of scheduling delays.
+        deadline = time.monotonic() + 30
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert marker.exists(), "fake OpenCode did not start its child"
+        return False
+
     try:
         with (
+            mock.patch.object(cross_ai, "_server_healthcheck", side_effect=wait_for_unhealthy_runtime),
             mock.patch.dict(
                 os.environ,
                 {
