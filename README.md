@@ -145,6 +145,11 @@ OpenCode reviewers share one dedicated server created for the Cross-AI run;
 server for debugging. Cross-AI does not use OpenCode's user-wide background
 service in either mode.
 
+If a shared OpenCode run exits successfully without the final completion event,
+Cross-AI asks that server to confirm the completed assistant message. It accepts
+the output only when the text matches and passes the normal output checks.
+Otherwise, an invalid shared result is retried once in standalone mode.
+
 ## Agent usage protocol
 
 The agent-owned review loop is deliberately explicit: run the cheap/default

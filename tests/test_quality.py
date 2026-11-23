@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import json
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -33,6 +34,134 @@ def opencode_output(text: str) -> bytes:
             json.dumps({"type": "step_finish", "part": {"messageID": "m1", "reason": "stop"}}),
         )
     ).encode()
+
+
+def missing_finish_stream(case: str, answer: str) -> bytes:
+    prelude = {"type": "step_finish", "sessionID": "ses_1", "part": {"messageID": "msg_old", "reason": "tool-calls"}}
+    event = {"type": "text", "sessionID": "ses_1", "part": {"messageID": "msg_1", "text": answer}}
+    events = [prelude, event]
+    if case == "explicit-finish":
+        events.append({**prelude, "part": {"messageID": "msg_1", "reason": "length"}})
+    if case == "ambiguous-session":
+        prelude["sessionID"] = "ses_other"
+    if case == "invalid-id":
+        event["part"] = {"messageID": "../msg_1", "text": answer}
+    if case == "error-event":
+        events.insert(1, {"type": "error", "sessionID": "ses_1"})
+    if case == "blank":
+        event["part"] = {"messageID": "msg_1", "text": " "}
+    return "\n".join(map(json.dumps, events)).encode()
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "confirmed",
+        "standalone",
+        "different",
+        "unfinished",
+        "wrong-role",
+        "wrong-id",
+        "error",
+        "no-completion-time",
+        "too-short",
+        "no-markers",
+        "malformed-api",
+        "failed-api",
+        "timed-out-api",
+        "failed-run",
+        "explicit-finish",
+        "ambiguous-session",
+        "invalid-id",
+        "error-event",
+        "blank",
+    ),
+)
+def test_opencode_missing_finish_confirms_before_retry(tmp_path: Path, case: str) -> None:
+    answer = "Finding: answer included shared-secret" if case != "no-markers" else "plain conclusion"
+    message = {
+        "id": "msg_1",
+        "type": "assistant",
+        "finish": "stop",
+        "time": {"completed": 1},
+        "content": [
+            {"type": "reasoning", "text": "not part of the review"},
+            {"type": "text", "text": "different" if case == "different" else answer},
+        ],
+    }
+    message.update(
+        {
+            "unfinished": {"finish": "length"},
+            "wrong-role": {"type": "user"},
+            "wrong-id": {"id": "msg_other"},
+            "error": {"error": {"message": "failed"}},
+            "no-completion-time": {"time": {}},
+        }.get(case, {})
+    )
+    current = replace(
+        request(tmp_path, "opencode"),
+        server_url=None if case == "standalone" else "http://127.0.0.1:1234",
+        server_password=None if case == "standalone" else "shared-secret",
+        min_output_chars=80 if case == "too-short" else 5,
+        require_review_markers=True,
+    )
+
+    first = mock.Mock(
+        communicate=mock.AsyncMock(return_value=(missing_finish_stream(case, answer), None)),
+        returncode=1 if case == "failed-run" else 0,
+    )
+    api_output = b"invalid JSON" if case == "malformed-api" else json.dumps({"data": message}).encode()
+    api = mock.Mock(
+        communicate=mock.AsyncMock(return_value=(api_output, None)),
+        returncode=1 if case == "failed-api" else 0,
+    )
+    if case == "timed-out-api":
+        api.communicate.side_effect = TimeoutError
+    retry = mock.Mock(
+        communicate=mock.AsyncMock(return_value=(opencode_output("Finding: " + "retry " * 20), None)),
+        returncode=0,
+    )
+    queries_api = case not in {
+        "standalone",
+        "failed-run",
+        "explicit-finish",
+        "ambiguous-session",
+        "invalid-id",
+        "error-event",
+        "blank",
+    }
+    processes = [first, api, retry] if queries_api else [first, retry]
+    config = tmp_path / "opencode.json"
+    with (
+        mock.patch.object(asyncio, "create_subprocess_exec", side_effect=processes) as spawn,
+        mock.patch.object(cross_ai, "_terminate_process", new_callable=mock.AsyncMock) as terminate,
+    ):
+        attempts = asyncio.run(cross_ai._collect_review_attempts(current, opencode_config_path=config))
+    if queries_api:
+        assert spawn.call_args_list[1].args == (
+            "/bin/opencode",
+            "api",
+            "--server",
+            current.server_url,
+            "GET",
+            "/api/session/ses_1/message/msg_1",
+        )
+        assert spawn.call_args_list[1].kwargs["env"]["OPENCODE_PASSWORD"] == "shared-secret"
+        assert spawn.call_args_list[1].kwargs["start_new_session"]
+    if case == "timed-out-api":
+        terminate.assert_awaited_once_with(api)
+    if case == "confirmed":
+        assert len(attempts) == 1 and spawn.call_count == 2
+        assert attempts[0].validation_error is None
+        assert attempts[0].final_text == "Finding: answer included <redacted>"
+        assert b"shared-secret" not in attempts[0].stdout
+    elif case in {"standalone", "failed-run"}:
+        assert len(attempts) == 1 and spawn.call_count == 1
+        assert attempts[0].final_text is None
+    else:
+        assert [attempt.mode for attempt in attempts] == ["shared", "standalone"]
+        assert attempts[0].validation_error is not None
+        assert attempts[1].final_text is not None
 
 
 def codex_output(text: str) -> bytes:

@@ -797,6 +797,49 @@ def _extract_final_review_text(stdout: bytes) -> str:
     return final_text
 
 
+def _missing_finish_candidate(stdout: bytes) -> tuple[str, str, str] | None:
+    events = _decode_review_output(stdout)
+    if not events or events[-1].get("type") != "text":
+        return None
+    last = events[-1]
+    part = last.get("part")
+    session_id = last.get("sessionID")
+    message_id = part.get("messageID") if isinstance(part, dict) else None
+    if not isinstance(session_id, str) or not isinstance(message_id, str):
+        return None
+    if any(not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", value) for value in (session_id, message_id)):
+        return None
+    if any(event.get("sessionID") != session_id or event.get("type") == "error" for event in events):
+        return None
+    texts, finishes = _collect_review_parts(events)
+    if any(step.get("messageID") == message_id or step.get("reason") != "tool-calls" for step in finishes):
+        return None
+    text = "\n".join(texts.get(message_id, ())).strip()
+    return (session_id, message_id, text) if text else None
+
+
+def _confirmed_message_text(payload: object, message_id: str, expected: str) -> str | None:
+    message = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(message, dict):
+        return None
+    if (message.get("id"), message.get("type"), message.get("finish"), message.get("error")) != (
+        message_id,
+        "assistant",
+        "stop",
+        None,
+    ):
+        return None
+    timing, content = message.get("time"), message.get("content")
+    if not isinstance(timing, dict) or type(timing.get("completed")) is not int or not isinstance(content, list):
+        return None
+    text = "\n".join(
+        part["text"]
+        for part in content
+        if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str)
+    ).strip()
+    return text if text == expected else None
+
+
 def _validate_final_review_text(final_text: str, *, min_output_chars: int, require_review_markers: bool) -> str:
     if len(final_text) < min_output_chars:
         raise ValueError(
@@ -1099,6 +1142,55 @@ def _validate_runtime_output(request: ReviewRequest, stdout: bytes) -> tuple[str
     return final_text, None
 
 
+async def _read_shared_message(request: ReviewRequest, server_url: str, path: str, env: dict[str, str]) -> object:
+    process = await asyncio.create_subprocess_exec(
+        request.runtime_bin,
+        "api",
+        "--server",
+        server_url,
+        "GET",
+        path,
+        cwd=request.repo_root,
+        env=env,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+        start_new_session=True,
+    )
+    try:
+        stdout, _ = await asyncio.wait_for(process.communicate(), timeout=30)
+    except TimeoutError:
+        await _terminate_process(process)
+        return None
+    except BaseException:
+        await _terminate_process(process)
+        raise
+    if process.returncode != 0 or len(stdout) > 1024 * 1024:
+        return None
+    return json.loads(stdout)
+
+
+async def _recover_shared_review(
+    request: ReviewRequest, server_url: str, stdout: bytes, env: dict[str, str]
+) -> str | None:
+    with contextlib.suppress(ValueError, OSError):
+        candidate = _missing_finish_candidate(stdout)
+        if candidate is not None:
+            session_id, message_id, expected = candidate
+            payload = await _read_shared_message(
+                request, server_url, f"/api/session/{session_id}/message/{message_id}", env
+            )
+            confirmed = _confirmed_message_text(payload, message_id, expected)
+            if confirmed is not None:
+                if request.server_password is not None:
+                    confirmed = confirmed.replace(request.server_password, "<redacted>")
+                return _validate_final_review_text(
+                    confirmed,
+                    min_output_chars=request.min_output_chars,
+                    require_review_markers=request.require_review_markers,
+                )
+    return None
+
+
 async def _review_attempt(
     request: ReviewRequest, *, server_url: str | None, opencode_config_path: Path
 ) -> ReviewAttempt:
@@ -1133,6 +1225,7 @@ async def _review_attempt(
     except BaseException:
         await _terminate_process(process)
         raise
+    raw_stdout = stdout
     if request.server_password is not None and server_url is not None:
         stdout = stdout.replace(request.server_password.encode(), b"<redacted>")
     returncode = _review_returncode(process.returncode, timed_out)
@@ -1144,6 +1237,10 @@ async def _review_attempt(
             permission_denials = _permission_denials(_decode_review_output(stdout))
     if returncode == 0:
         final_text, validation_error = _validate_runtime_output(request, stdout)
+        if validation_error is not None and server_url is not None and request.review_model.runtime == "opencode":
+            final_text = await _recover_shared_review(request, server_url, raw_stdout, env)
+            if final_text is not None:
+                validation_error = None
     return ReviewAttempt(
         command=command,
         stdout=stdout,
