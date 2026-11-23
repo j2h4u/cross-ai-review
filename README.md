@@ -211,10 +211,13 @@ deptry when third-party runtime dependencies are introduced. The CodeQL
 workflow uses full version tags. A separate pin-policy checker would protect
 future workflow edits.
 
-Evaluate mutation testing with a focused run on review-result and
-process-cleanup tests before adding a recurring gate. Review a clone baseline
-before enforcing it. Revisit a suppression budget if lint or typing exceptions
-start accumulating.
+Mutation testing is outside the QA scope for this small CLI because its
+maintenance cost has no clear payoff. The initial clone audit using the Python
+template's pyscn and jscpd policies found six production pairs across runtime
+adapters, configuration validation, and report formatting. Those pairs serve
+distinct contracts. It also found two overlaps in lifecycle test setup and
+invocation. Revisit a suppression budget if lint or typing exceptions start
+accumulating.
 
 This public repository currently has no open-source license. Public visibility
 does not grant permission to copy, modify, or redistribute the code.
