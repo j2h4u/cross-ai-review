@@ -8,7 +8,7 @@ default_timeout_seconds = 900
 [runtimes.codex]
 
 [profiles.standard]
-reviewers = ["deepseek-v4-1-flash", "glm-5-3"]
+reviewers = ["deepseek-v4-1-flash", "glm-5-4"]
 
 [profiles.premium]
 reviewers = ["claude-opus-5-5", "codex-astra-high"]
@@ -23,9 +23,9 @@ runtime = "opencode"
 model = "deepseek/deepseek-v4-pro"
 reasoning = "max"
 
-[reviewers.glm-5-3]
+[reviewers.glm-5-4]
 runtime = "opencode"
-model = "zai-coding-plan/glm-5.3"
+model = "zai-coding-plan/glm-5.4"
 reasoning = "max"
 timeout_seconds = 1800
 
